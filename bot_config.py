@@ -13,7 +13,7 @@ class BotConfig:
     def __init__(self):
         self.telegram_bot_token = self._get_env_var('TELEGRAM_BOT_TOKEN')
         self.openrouter_api_key = self._get_env_var('OPENROUTER_API_KEY')
-        self.max_history_messages = 20  # сколько последних сообщений хранить для контекста
+        self.max_history_messages = 30  # сколько последних сообщений хранить для контекста
         self.system_prompt = self._get_system_prompt()
 
     def _get_env_var(self, name: str) -> str:
