@@ -4,9 +4,14 @@
 Telegram Bot «Проводник Души» (DeepSeek API).
 
 Личные чаты — отвечает на всё; группы — на слово-триггер или ответ.
+
 Ленивая персонализация: без анкет. Дата рождения перехватывается из
 разговора, остальное модель сохраняет тихими маркерами [SAVE: ...].
-Книга уроков и фокус недели живут в user_data.json.
+Точные расчёты (Сюцай, личный год, фаза возраста) — кодом в calculations.py.
+Книга уроков, фокус недели, профиль — в user_data.json (переживают рестарт).
+
+КПТ: детектор словесных ловушек в коде (подсказка модели в последний
+user-текст), /rebuild N — пошаговая пересборка убеждения.
 """
 
 import json
@@ -26,7 +31,13 @@ from telegram.ext import (
     filters,
 )
 
-from bot_config import BotConfig, MORNING_PROMPT, EVENING_PROMPT, SUNDAY_EVENING_ADD
+from bot_config import (
+    BotConfig,
+    MORNING_PROMPT,
+    EVENING_PROMPT,
+    SUNDAY_EVENING_ADD,
+    REBUILD_PROMPT,
+)
 from calculations import calc_summary, parse_birth_date, build_calc_lines
 from openrouter_client import OpenRouterClient
 from message_memory import MessageMemory
@@ -77,6 +88,36 @@ PROFILE_LABELS = {
 ASKABLE = ('psychotype', 'hd', 'gender', 'chronotype',
            'solar', 'red_button', 'main_request')
 
+# --- Детектор словесных ловушек: КПТ-линзы в коде, ноль токенов в промте ---
+COGNITIVE_PATTERNS = [
+    (re.compile(r'\b(всегда|никогда|постоянно|вечно)\b', re.IGNORECASE),
+     'обобщение «всегда/никогда» — спроси про исключение'),
+    (re.compile(r'\b(должен|должна|обязан|обязана|надо же)\b', re.IGNORECASE),
+     'долженствование — спроси, кто и когда это назначил'),
+    (re.compile(r'\b(все люди|никто|все вокруг|всем|ничего не выйдет|'
+                r'всё бесполезно|конец)\b', re.IGNORECASE),
+     'чёрно-белое/катастрофизация — предложи шкалу 0–10'),
+    (re.compile(r'\b(наверное|а вдруг|а если|вдруг)\b', re.IGNORECASE),
+     'катастрофизация «а вдруг» — спроси, какова реальная вероятность'),
+    (re.compile(r'\b(обычно|типичный|привычка|как всегда|по привычке)\b',
+                re.IGNORECASE),
+     'автопилот — спроси, что он выбирает сам, а что «так принято»'),
+    (re.compile(r'\b(я такой|я не тот|у меня характер|такой как я)\b',
+                re.IGNORECASE),
+     'ярлык на себя — спроси, когда он не был «таким»'),
+]
+
+
+def detect_patterns(text: str, limit: int = 2) -> List[str]:
+    """Максимум limit подсказок, чтобы не заваливать модель."""
+    found = []
+    for rx, hint in COGNITIVE_PATTERNS:
+        if rx.search(text):
+            found.append(hint)
+            if len(found) >= limit:
+                break
+    return found
+
 
 class SoulGuideBot:
     def __init__(self):
@@ -118,8 +159,10 @@ class SoulGuideBot:
             "/evening — разбор дня: три вопроса (в воскресенье — и фокус недели)\n\n"
             "<b>Книга уроков:</b>\n"
             "/lessons — найденные убеждения и стратегии\n"
+            "/rebuild N — пошаговая пересборка убеждения (урока N)\n"
             "/done N — пометить урок проработанным\n"
-            "/focus N или /focus тема — фокус недели\n\n"
+            "/focus N или /focus тема — фокус недели\n"
+            "/lesson текст — добавить урок вручную\n\n"
             "<b>Данные:</b>\n"
             "/set ключ значение — birth, пол, psychotype, hd, соляр, хронотип, "
             "кнопка, запрос\n"
@@ -238,7 +281,8 @@ class SoulGuideBot:
                          f" (с {l.get('created', '?')})")
         if focus.get('theme'):
             lines.append(f"\n🎯 Фокус недели: «{focus['theme']}»")
-        lines.append("\n/done N — проработан · /focus N — фокусом недели")
+        lines.append("\n/rebuild N — пересборка · /done N — проработан · "
+                     "/focus N — фокус недели")
         await update.message.reply_text("\n".join(lines))
 
     async def lesson_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -311,6 +355,37 @@ class SoulGuideBot:
         self._set_focus(chat_id, theme)
         await update.message.reply_text(f"🎯 Фокус недели: «{theme}»")
 
+    async def rebuild_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """/rebuild N — пошаговая пересборка убеждения (урока N) по КПТ-цепочке"""
+        chat_id = update.effective_chat.id
+        lessons = (self.user_data.get(chat_id) or {}).get('lessons') or []
+        if not context.args or not context.args[0].isdigit():
+            await update.message.reply_text(
+                "Формат: /rebuild N — пересборка урока N. Список: /lessons"
+            )
+            return
+        n = int(context.args[0])
+        lesson = next((l for l in lessons if l['id'] == n), None)
+        if not lesson:
+            await update.message.reply_text(f"Урока {n} нет. Список: /lessons")
+            return
+
+        user = update.effective_user
+        username = ((user.username or user.first_name or "Искатель")
+                    if user else "Искатель")
+        self.memory.add_message(chat_id, {
+            'user_id': user.id if user else 0,
+            'username': username,
+            'text': f'🔧 Пересборка урока {n}: «{lesson["title"]}»',
+            'timestamp': update.message.date.isoformat(),
+            'is_bot': False,
+        })
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+        response = await self.generate_response(
+            chat_id, update.message.chat.type, mode='rebuild'
+        )
+        await self._process_and_reply(update.message, chat_id, response)
+
     async def clear_memory_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
         self.memory.clear_chat_memory(chat_id)
@@ -325,7 +400,8 @@ class SoulGuideBot:
         message = update.message
         chat_id = update.effective_chat.id
         user = update.effective_user
-        username = (user.username or user.first_name or "Искатель") if user else "Искатель"
+        username = ((user.username or user.first_name or "Искатель")
+                    if user else "Искатель")
 
         self.memory.add_message(chat_id, {
             'user_id': user.id if user else 0,
@@ -344,7 +420,8 @@ class SoulGuideBot:
         message = update.message
         chat_id = update.effective_chat.id
         user = update.effective_user
-        username = (user.username or user.first_name or "Искатель") if user else "Искатель"
+        username = ((user.username or user.first_name or "Искатель")
+                    if user else "Искатель")
 
         self.memory.add_message(chat_id, {
             'user_id': user.id if user else 0,
@@ -418,7 +495,7 @@ class SoulGuideBot:
             # 3. Автоперехват даты рождения (личка, ещё не известна)
             self._try_capture_birth(chat_id, text, chat_type)
 
-            # 4. Память: текущее сообщение — последнее в истории
+            # 4. Память: чистый текст (подсказка паттерна туда не попадает)
             self.memory.add_message(chat_id, {
                 'user_id': user.id,
                 'username': username,
@@ -432,8 +509,17 @@ class SoulGuideBot:
 
             await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
-            # 5. Генерация + разбор маркеров + ответ
-            response = await self.generate_response(chat_id, chat_type)
+            # 5. Детектор ловушек: подсказка модели в последний user-текст
+            pattern_hint = detect_patterns(text)
+            if pattern_hint:
+                text_for_model = f"{text}\n[Паттерн: {'; '.join(pattern_hint)}]"
+            else:
+                text_for_model = text
+
+            # 6. Генерация + разбор маркеров + ответ
+            response = await self.generate_response(
+                chat_id, chat_type, user_text=text_for_model
+            )
             await self._process_and_reply(message, chat_id, response)
 
         except Exception as e:
@@ -449,8 +535,8 @@ class SoulGuideBot:
 
     def _try_capture_birth(self, chat_id: int, text: str, chat_type: str) -> bool:
         """Тихо ловит ДД.ММ.ГГГГ в личке, если ДР ещё не известен.
-        Защита от ложных срабатываний: только личка, только впервые,
-        год в прошлом, дата валидна, возраст >= 5."""
+        Защита: только личка, только впервые, валидная дата,
+        год в прошлом, возраст >= 5."""
         if chat_type != 'private':
             return False
         info = self.user_data.get(chat_id)
@@ -540,10 +626,18 @@ class SoulGuideBot:
     # ---------------- Генерация ----------------
 
     async def generate_response(self, chat_id: int, chat_type: str,
-                                mode: Optional[str] = None) -> Optional[str]:
+                                mode: Optional[str] = None,
+                                user_text: Optional[str] = None) -> Optional[str]:
         try:
             history = self.memory.get_chat_messages(chat_id)
             context_history = history[-self.config.max_history_messages:]
+
+            # Последнее user-сообщение — с подсказкой о паттернах (если есть);
+            # остальная история — как есть
+            if user_text and context_history and not context_history[-1]['is_bot']:
+                context_history = context_history[:-1] + [
+                    {**context_history[-1], 'text': user_text}
+                ]
 
             messages = [{
                 "role": "system",
@@ -617,6 +711,8 @@ class SoulGuideBot:
             blocks.append(EVENING_PROMPT)
             if now.weekday() == 6:  # воскресенье
                 blocks.append(SUNDAY_EVENING_ADD)
+        elif mode == 'rebuild':
+            blocks.append(REBUILD_PROMPT)
 
         return "\n".join(blocks)
 
@@ -634,9 +730,7 @@ class SoulGuideBot:
             if confirms:
                 clean = "Записал."
             else:
-                await message.reply_text(
-                    "⚠️ Пустой ответ. Попробуй ещё раз."
-                )
+                await message.reply_text("⚠️ Пустой ответ. Попробуй ещё раз.")
                 return
 
         out = clean if not confirms else clean + "\n\n" + "\n".join(confirms)
@@ -645,7 +739,7 @@ class SoulGuideBot:
         for i in range(0, len(out), TELEGRAM_MSG_LIMIT):
             sent = await message.reply_text(out[i:i + TELEGRAM_MSG_LIMIT])
 
-        # В память — только чистый текст модели (маркеры не возвращаются в историю)
+        # В память — только чистый текст (маркеры не возвращаются в историю)
         self.memory.add_message(chat_id, {
             'user_id': 0,
             'username': self.bot_username or 'Проводник',
@@ -717,6 +811,7 @@ class SoulGuideBot:
         application.add_handler(CommandHandler("lesson", self.lesson_command))
         application.add_handler(CommandHandler("done", self.done_command))
         application.add_handler(CommandHandler("focus", self.focus_command))
+        application.add_handler(CommandHandler("rebuild", self.rebuild_command))
         application.add_handler(CommandHandler("clear_memory",
                                                self.clear_memory_command))
         application.add_handler(
