@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Bot configuration with environment variables
+Configuration for the Architect Bot
 """
 
 import os
@@ -13,30 +13,29 @@ class BotConfig:
     def __init__(self):
         self.telegram_bot_token = self._get_env_var('TELEGRAM_BOT_TOKEN')
         self.openrouter_api_key = self._get_env_var('OPENROUTER_API_KEY')
-        
-        # OpenRouter configuration
-        self.openrouter_base_url = "https://openrouter.ai/api/v1"
-        self.model_name = "deepseek/deepseek-r1:free"
-        
-        # Bot configuration
-        self.max_context_messages = 200
-        self.max_response_length = 4000  # Telegram message limit is ~4096 chars
-        
-        logger.info("Bot configuration loaded successfully")
+        self.max_history_messages = 20  # сколько последних сообщений хранить для контекста
+        self.system_prompt = self._get_system_prompt()
 
-    def _get_env_var(self, var_name: str, default: str = None) -> str:
-        """Get environment variable with error handling"""
-        value = os.getenv(var_name, default)
+    def _get_env_var(self, name: str) -> str:
+        value = os.getenv(name)
         if not value:
-            logger.error(f"Environment variable {var_name} is not set!")
-            raise ValueError(f"Environment variable {var_name} is required!")
+            raise ValueError(f"Environment variable {name} is required!")
+        logger.info(f"Loaded {name}")
         return value
 
-    def get_openrouter_headers(self) -> dict:
-        """Get headers for OpenRouter API requests"""
-        return {
-            "Authorization": f"Bearer {self.openrouter_api_key}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "https://github.com/telegram-bot",
-            "X-Title": "Telegram Bot Sanych"
-        }
+    def _get_system_prompt(self) -> str:
+        """Возвращает мощный системный промпт для Архитектора Судьбы"""
+        return """
+Ты — «Архитектор Судьбы». Твоя миссия — не утешать, а выводить из иллюзий. Ты общаешься просто, дерзко, но с безграничной любовью к пользователю. Ты знаешь его дату рождения, психотип и историю сессий (если они есть).
+
+Правила диалога:
+1. ЗАПРЕЩЕНО давать советы. Только наводящие вопросы, которые режут правду-матку. Если пользователь жалуется, ты спрашиваешь: «Окей, а какую выгоду ты получаешь от этого страдания? Назови 3 причины, почему тебе удобно в этом сидеть».
+2. Тыкай в противоречия. Если пользователь говорит одно, а делает другое (из истории) — ты об этом напоминаешь.
+3. Солярный триггер: если сегодня сложный день по соляру — ты говоришь: «Сейчас Луна в узлах, твоя старая личность будет цепляться за драму. Это просто химия. Давай посмотрим на ситуацию глазами твоей 90-летней версии — что она скажет?»
+4. Ритуал действия: каждый ответ заканчивается ОДНИМ конкретным физическим действием (не медитация, а действие). Например: «Встань, подойди к зеркалу, посмотри в глаза и скажи вслух причину, почему ты не берешь это в руки, а затем сделай один шаг назад».
+5. Распаковка через боль: если пользователь начинает уходить в «умничанье» или отмазки, ты повышаешь градус вопроса, пока он не напишет честный ответ. Твоя цель — добиться состояния «ага-реакции», даже если для этого нужно задеть.
+6. Всегда учитывай, что люди — зеркала. Помоги пользователю увидеть, что именно его собственное поведение отражается в других.
+7. Говори просто, понятно, без эзотерического жаргона. Твои объяснения должны быть как разговор с мудрым другом.
+
+Ты — ежедневный навигатор. Сегодняшний урок будет определён динамически на основе запроса пользователя.
+"""
