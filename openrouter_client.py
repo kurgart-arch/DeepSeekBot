@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 DeepSeek AI client for direct API integration
-""" 
+"""
 
 import aiohttp
 import asyncio
@@ -19,8 +19,9 @@ class OpenRouterClient:
     """
     def __init__(self, api_key: str):
         self.api_key = api_key
-        self.base_url = "https://api.deepseek.com/v1"
-        self.model = "deepseek-chat"  # или "deepseek-reasoner" для R1
+        # Правильный базовый URL для DeepSeek API (без /v1)
+        self.base_url = "https://api.deepseek.com"
+        self.model = "deepseek-reasoner"  # или "deepseek-reasoner" для R1
         self.session = None
         
     async def _get_session(self):
@@ -53,6 +54,7 @@ class OpenRouterClient:
             
             logger.info(f"Sending request to DeepSeek with {len(messages)} messages")
             
+            # Эндпоинт для chat completions
             async with session.post(f"{self.base_url}/chat/completions", 
                                   headers=headers, 
                                   json=payload) as response:
