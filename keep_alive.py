@@ -1,80 +1,108 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Keep-alive mechanism to prevent the bot from sleeping
+Keep-alive: HTTP-сервер /health + self-ping каждые 5 минут (Replit).
+Импорт модуля НЕ имеет побочных эффектов — сервер запускается явно
+через start_keep_alive_server() из main.py.
 """
 
-import time
-import threading
+import json
 import logging
-import requests
-from urllib.parse import urlparse
 import os
+import threading
+import time
+import urllib.request
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+# Живое состояние бота — main.py обновляет через update_status(),
+# /health отдаёт его наружу (полезно для UptimeRobot и Replit Autoscale).
+STATUS = {
+    "started_at": time.time(),
+    "last_update": None,
+}
+
+
+def update_status(**kwargs) -> None:
+    STATUS.update(kwargs)
+
+
+def _resolve_replit_url() -> Optional[str]:
+    """Публичный URL реплита или None (локальный запуск / не Replit)."""
+    domain = os.getenv('REPLIT_DEV_DOMAIN') or os.getenv('REPL_URL')
+    if not domain:
+        return None
+    if domain.startswith('http'):
+        return domain.rstrip('/')
+    return f"https://{domain}"
+
+
+class HealthHandler(BaseHTTPRequestHandler):
+    # BaseHTTPRequestHandler, а НЕ SimpleHTTPRequestHandler:
+    # последний по умолчанию раздаёт файлы текущей директории
+    def do_GET(self):
+        if self.path == '/health':
+            body = json.dumps(STATUS).encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_response(404)
+            self.send_header('Content-Length', '0')
+            self.end_headers()
+
+    def log_message(self, format, *args):
+        pass  # не спамим логами
+
+
+_server_started = False
+_server_lock = threading.Lock()
+
+
+def start_keep_alive_server(port: Optional[int] = None) -> None:
+    """Запускает /health-сервер один раз. Порт: env HEALTH_PORT или 5000."""
+    global _server_started
+    if port is None:
+        port = int(os.getenv('HEALTH_PORT', '5000'))
+    with _server_lock:
+        if _server_started:
+            return
+        try:
+            httpd = HTTPServer(('0.0.0.0', port), HealthHandler)
+            threading.Thread(
+                target=httpd.serve_forever, daemon=True, name='health-server'
+            ).start()
+            _server_started = True
+            logger.info(f"Health-сервер запущен: порт {port}")
+        except OSError as e:
+            logger.warning(f"Health-сервер не запущен (порт {port} занят?): {e}")
+
+
 def keep_alive_thread():
-    """Keep alive thread function"""
-    logger.info("Keep-alive thread started")
-    
-    # Get current URL if running on Replit
-    replit_url = os.getenv('REPL_URL')
-    
+    """Self-ping каждые 5 минут — держит Replit-реплит активным."""
+    logger.info("Keep-alive поток запущен")
+    url = _resolve_replit_url()
+
+    if not url:
+        logger.info(
+            "Replit-URL не найден — self-ping выключен "
+            "(обычный локальный запуск или VPS)"
+        )
+
     while True:
+        time.sleep(300)  # 5 минут
         try:
-            # Sleep for 5 minutes
-            time.sleep(300)  # 300 seconds = 5 minutes
-            
-            # Send a simple HTTP request to keep the service alive
-            if replit_url:
+            if url:
                 try:
-                    response = requests.get(f"{replit_url}/health", timeout=10)
-                    logger.debug(f"Keep-alive ping status: {response.status_code}")
-                except requests.RequestException as e:
-                    logger.debug(f"Keep-alive ping failed (this is normal): {e}")
-            
-            # Log heartbeat
+                    with urllib.request.urlopen(f"{url}/health", timeout=10) as r:
+                        logger.debug(f"Keep-alive ping: HTTP {r.status}")
+                except OSError as e:
+                    logger.debug(f"Keep-ping не прошёл (не критично): {e}")
             logger.info("Keep-alive heartbeat")
-            
         except Exception as e:
-            logger.error(f"Error in keep-alive thread: {e}")
-            time.sleep(60)  # Wait 1 minute before retrying
-
-def start_keep_alive_server():
-    """Start a simple HTTP server for health checks"""
-    try:
-        from http.server import HTTPServer, SimpleHTTPRequestHandler
-        import socketserver
-        
-        class HealthHandler(SimpleHTTPRequestHandler):
-            def do_GET(self):
-                if self.path == '/health':
-                    self.send_response(200)
-                    self.send_header('Content-type', 'text/plain')
-                    self.end_headers()
-                    self.wfile.write(b'OK')
-                else:
-                    self.send_response(404)
-                    self.end_headers()
-            
-            def log_message(self, format, *args):
-                # Suppress HTTP server logs
-                pass
-        
-        # Try to bind to port 5000 (frontend port)
-        try:
-            httpd = HTTPServer(('0.0.0.0', 5000), HealthHandler)
-            server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-            server_thread.start()
-            logger.info("Health check server started on port 5000")
-        except OSError:
-            # Port might be in use, that's okay
-            logger.debug("Could not start health server on port 5000 (port in use)")
-            
-    except ImportError:
-        logger.debug("HTTP server not available, skipping health check server")
-    except Exception as e:
-        logger.error(f"Error starting health check server: {e}")
-
-# Start the health check server when module is imported
-start_keep_alive_server()
+            logger.error(f"Ошибка в keep-alive: {e}")
+            time.sleep(60)
