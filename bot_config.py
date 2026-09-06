@@ -52,6 +52,9 @@ class BotConfig:
         # вскрывать противоречия; компактный формат ответов компенсирует рост
         self.max_history_messages = int(_get_env_var('MAX_HISTORY_MESSAGES',
                                                      required=False, default='12'))
+        self.memory_messages = int(_get_env_var('MEMORY_MESSAGES', required=False, default='50'))
+        self.memory_file = _get_env_var('MEMORY_FILE', required=False, default='chat_memory.json')
+        self.user_data_file = _get_env_var('USER_DATA_FILE', required=False, default='user_data.json')
 
         # --- Промпт ---
         self.system_prompt = SYSTEM_PROMPT
