@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-OpenRouter AI client for DeepSeek R1 integration
+DeepSeek AI client for direct API integration
 """
 
 import aiohttp
@@ -13,10 +13,14 @@ from typing import List, Dict, Optional
 logger = logging.getLogger(__name__)
 
 class OpenRouterClient:
+    """
+    Клиент для работы с DeepSeek API напрямую.
+    Название класса оставлено для совместимости с existing code.
+    """
     def __init__(self, api_key: str):
         self.api_key = api_key
-        self.base_url = "https://openrouter.ai/api/v1"
-        self.model = "deepseek/deepseek-r1"
+        self.base_url = "https://api.deepseek.com/v1"
+        self.model = "deepseek-chat"  # или "deepseek-reasoner" для R1
         self.session = None
         
     async def _get_session(self):
@@ -27,21 +31,19 @@ class OpenRouterClient:
         return self.session
     
     async def generate_response(self, messages: List[Dict], max_tokens: int = 600) -> Optional[str]:
-        """Generate response using OpenRouter API"""
+        """Generate response using DeepSeek API"""
         try:
             session = await self._get_session()
             
             headers = {
                 "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-                "HTTP-Referer": "https://github.com/telegram-bot-sanych",
-                "X-Title": "Telegram Bot Sanych"
+                "Content-Type": "application/json"
             }
             
             payload = {
                 "model": self.model,
                 "messages": messages,
-                "max_tokens": min(max_tokens, 600),  # Limit to 600 tokens to fit budget
+                "max_tokens": min(max_tokens, 600),
                 "temperature": 0.7,
                 "top_p": 0.9,
                 "frequency_penalty": 0.1,
@@ -49,7 +51,7 @@ class OpenRouterClient:
                 "stream": False
             }
             
-            logger.info(f"Sending request to OpenRouter with {len(messages)} messages")
+            logger.info(f"Sending request to DeepSeek with {len(messages)} messages")
             
             async with session.post(f"{self.base_url}/chat/completions", 
                                   headers=headers, 
@@ -68,11 +70,11 @@ class OpenRouterClient:
                         
                 else:
                     error_text = await response.text()
-                    logger.error(f"OpenRouter API error {response.status}: {error_text}")
+                    logger.error(f"DeepSeek API error {response.status}: {error_text}")
                     return None
                     
         except asyncio.TimeoutError:
-            logger.error("Timeout while calling OpenRouter API")
+            logger.error("Timeout while calling DeepSeek API")
             return None
         except aiohttp.ClientError as e:
             logger.error(f"HTTP client error: {e}")
@@ -81,7 +83,7 @@ class OpenRouterClient:
             logger.error(f"JSON decode error: {e}")
             return None
         except Exception as e:
-            logger.error(f"Unexpected error calling OpenRouter API: {e}")
+            logger.error(f"Unexpected error calling DeepSeek API: {e}")
             return None
     
     async def close(self):
