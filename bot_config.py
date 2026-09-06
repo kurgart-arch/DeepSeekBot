@@ -42,12 +42,11 @@ class BotConfig:
 
         # --- Параметры LLM: опционально, меняются через env без правки кода ---
         # Проверь точный слаг модели, который используешь на OpenRouter
-        self.model = _get_env_var('DEEPSEEK_MODEL', required=False,
-                                  default='deepseek/deepseek-chat')
+        self.model = _get_env_var('DEEPSEEK_MODEL', required=False, default='deepseek-chat')
         # Жёсткий потолок токенов на один ответ — прямой рычаг экономии
         self.max_tokens = int(_get_env_var('MAX_TOKENS', required=False, default='600'))
         self.temperature = float(_get_env_var('TEMPERATURE', required=False, default='0.8'))
-
+        self.request_timeout = float(_get_env_var('REQUEST_TIMEOUT', required=False, default='60'))
         # --- Память контекста ---
         # 12 вместо 7: боту нужны более ранние слова пользователя, чтобы
         # вскрывать противоречия; компактный формат ответов компенсирует рост
