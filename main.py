@@ -10,6 +10,7 @@ import json
 import logging
 import re
 import threading
+import time  # в импорты
 from typing import Dict, Optional
 
 from telegram import Update
@@ -24,7 +25,7 @@ from telegram.ext import (
 from bot_config import BotConfig
 from openrouter_client import OpenRouterClient
 from message_memory import MessageMemory
-from keep_alive import keep_alive_thread
+from keep_alive import keep_alive_thread, start_keep_alive_server, update_status
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -133,7 +134,9 @@ class ArchitectBot:
             user = update.effective_user
             if user is None or user.is_bot:
                 return
-
+                
+            update_status(last_update=time.time()) 
+            
             chat_id = update.effective_chat.id
             chat_type = message.chat.type
             username = user.username or user.first_name or "Искатель"
@@ -297,6 +300,8 @@ class ArchitectBot:
         logger.info("AI-клиент закрыт")
 
     def run(self):
+        start_keep_alive_server()
+        
         keep_alive = threading.Thread(target=keep_alive_thread, daemon=True)
         keep_alive.start()
         logger.info("Keep-alive поток запущен")
