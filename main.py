@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Telegram Bot "Архитектор Судьбы" with DeepSeek API (via OpenRouter).
-Отвечает на все сообщения в личных чатах, в группах — только на упоминание.
+Telegram Bot "Архитектор Судьбы" (DeepSeek API).
+Личные чаты — отвечает на всё; группы — только на упоминание.
 """
 
 import logging
 import re
 import threading
+from typing import Optional
 
 from telegram import Update
 from telegram.ext import (
@@ -29,25 +30,36 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TELEGRAM_MSG_LIMIT = 4096
-# Слова-триггеры в группах (согласованы с текстом /start)
+TELEGRAM_MSG_LIMIT = 4096  # лимит Telegram на одно сообщение
+# Триггеры в группах — согласованы с текстом /start
 GROUP_KEYWORDS = ("наставник", "архитектор")
 
 
 class ArchitectBot:
     def __init__(self):
         self.config = BotConfig()
-        self.ai_client = OpenRouterClient(self.config.openrouter_api_key)
+
+        # AI-клиент: все параметры берём из конфига (env)
+        self.ai_client = OpenRouterClient(
+            api_key=self.config.openrouter_api_key,
+            model=self.config.model,
+            max_tokens=self.config.max_tokens,
+            temperature=self.config.temperature,
+            timeout=self.config.request_timeout,
+        )
+
         self.memory = MessageMemory(
             max_messages_per_chat=self.config.max_history_messages
         )
         self.bot_username = None
         # Персональные данные: chat_id -> {birth_date, psychotype, session_digest}
+        # Живут в памяти процесса — при перезапуске сбрасываются
         self.user_data = {}
 
-    # ---------- Команды ----------
+    # ---------------- Команды ----------------
 
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик /start"""
         await update.message.reply_text(
             "🧘 Приветствую, искатель!\n\n"
             "Я — твой Архитектор Судьбы. Я не даю готовых ответов — "
@@ -57,11 +69,13 @@ class ArchitectBot:
         )
 
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик /help"""
         help_text = (
             "🧭 <b>Архитектор Судьбы</b> — твой наставник и зеркало.\n\n"
             "<b>Как использовать:</b>\n"
             "• В личных сообщениях я отвечаю на всё, что ты напишешь.\n"
-            f"• Я помню последние {self.config.max_history_messages} сообщений этого чата.\n\n"
+            f"• Я помню последние {self.config.max_history_messages} сообщений "
+            "этого чата.\n\n"
             "<b>Команды:</b>\n"
             "/start — начать диалог\n"
             "/help — эта справка\n"
@@ -97,13 +111,14 @@ class ArchitectBot:
         )
 
     async def clear_memory_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Очистка памяти чата"""
         chat_id = update.effective_chat.id
         self.memory.clear_chat_memory(chat_id)
         await update.message.reply_text(
             "🧹 Память этого чата очищена. Начнём с чистого листа."
         )
 
-    # ---------- Сообщения ----------
+    # ---------------- Сообщения ----------------
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Главный обработчик текстовых сообщений"""
@@ -111,18 +126,18 @@ class ArchitectBot:
             message = update.message
             if not message or not message.text:
                 return
-            # Не реагируем на других ботов (защита от циклов)
-            if update.effective_user and update.effective_user.is_bot:
+
+            # Канальные посты и другие боты — игнор (защита от бот-циклов)
+            user = update.effective_user
+            if user is None or user.is_bot:
                 return
 
             chat_id = update.effective_chat.id
             chat_type = message.chat.type
-            username = (update.effective_user.username
-                        or update.effective_user.first_name
-                        or "Искатель")
+            username = user.username or user.first_name or "Искатель"
             raw_text = message.text
 
-            # 1. Решаем, нужно ли отвечать (по исходному тексту)
+            # 1. Решаем, отвечать ли (по исходному тексту, до чистки)
             should_respond = False
             if chat_type == 'private':
                 should_respond = True
@@ -140,7 +155,7 @@ class ArchitectBot:
                 if should_respond:
                     logger.info(f"Group mention in chat {chat_id}")
 
-            # 2. Вырезаем @username бота из текста — чистый промт, экономия токенов
+            # 2. Вырезаем @username бота — чистый промт, экономия токенов
             text = raw_text
             if self.bot_username:
                 text = re.sub(
@@ -149,22 +164,25 @@ class ArchitectBot:
                 ).strip()
                 text = re.sub(r' {2,}', ' ', text)
 
-            # 3. Сохраняем сообщение в память
-            #    (групповые — даже без ответа, для контекста)
+            # Сообщение из одного только @упоминания содержания не несёт
+            if not text:
+                return
+
+            # 3. Память: текущее сообщение станет последним в истории
             self.memory.add_message(chat_id, {
-                'user_id': update.effective_user.id,
+                'user_id': user.id,
                 'username': username,
                 'text': text,
                 'timestamp': message.date.isoformat(),
-                'is_bot': False
+                'is_bot': False,
             })
 
-            if not should_respond or not text:
+            if not should_respond:
                 return
 
             await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
-            # 4. Текущее сообщение уже последнее в истории — НЕ дублируем его
+            # 4. Генерация: история уже содержит текущее сообщение — не дублируем
             response = await self.generate_response(chat_id, chat_type)
 
             if response:
@@ -178,7 +196,7 @@ class ArchitectBot:
                     'username': self.bot_username or 'Архитектор',
                     'text': response,
                     'timestamp': (sent.date if sent else message.date).isoformat(),
-                    'is_bot': True
+                    'is_bot': True,
                 })
             else:
                 await message.reply_text(
@@ -194,15 +212,17 @@ class ArchitectBot:
             except Exception:
                 pass
 
-    async def generate_response(self, chat_id: int, chat_type: str) -> str:
-        """Генерация ответа через LLM с системным промтом и контекстом"""
+    # ---------------- Генерация ответа ----------------
+
+    async def generate_response(self, chat_id: int, chat_type: str) -> Optional[str]:
+        """Сборка сообщений для LLM и вызов клиента"""
         try:
             history = self.memory.get_chat_messages(chat_id) or []
             context_history = history[-self.config.max_history_messages:]
 
             messages = [{
                 "role": "system",
-                "content": self._build_system_prompt(chat_id)
+                "content": self._build_system_prompt(chat_id),
             }]
 
             for msg in context_history:
@@ -212,9 +232,10 @@ class ArchitectBot:
                 elif chat_type in ('group', 'supergroup'):
                     content = f"{msg['username']}: {msg['text']}"  # различаем участников
                 else:
-                    content = msg['text']  # в личке роли достаточны
+                    content = msg['text']  # в личке ролей достаточно
                 messages.append({"role": role, "content": content})
 
+            # model, max_tokens, temperature, ретраи и таймаут — внутри клиента
             return await self.ai_client.generate_response(messages)
 
         except Exception as e:
@@ -234,17 +255,25 @@ class ArchitectBot:
             )
         return prompt
 
-    # ---------- Инфраструктура ----------
+    # ---------------- Инфраструктура ----------------
 
     async def error_handler(self, update, context: ContextTypes.DEFAULT_TYPE):
+        """Глобальный обработчик ошибок"""
         logger.error(f"Исключение: {context.error}")
 
     async def post_init(self, application: Application):
+        """Выполняется после запуска: запоминаем username бота"""
         bot_info = await application.bot.get_me()
         self.bot_username = bot_info.username
         logger.info(f"Бот запущен: @{self.bot_username}")
 
+    async def post_shutdown(self, application: Application):
+        """Выполняется при остановке: закрываем HTTP-сессию AI-клиента"""
+        await self.ai_client.close()
+        logger.info("AI-клиент закрыт")
+
     def run(self):
+        """Запуск бота"""
         keep_alive = threading.Thread(target=keep_alive_thread, daemon=True)
         keep_alive.start()
         logger.info("Keep-alive поток запущен")
@@ -252,6 +281,7 @@ class ArchitectBot:
         application = Application.builder() \
             .token(self.config.telegram_bot_token) \
             .post_init(self.post_init) \
+            .post_shutdown(self.post_shutdown) \
             .build()
 
         application.add_handler(CommandHandler("start", self.start_command))
