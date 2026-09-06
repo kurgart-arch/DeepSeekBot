@@ -1,67 +1,90 @@
-# Инструкции по развертыванию Telegram бота
+markdown
+
+# Инструкции по развертыванию Telegram-бота «Архитектор Судьбы»
+
+Этот бот — ваш персональный наставник на базе DeepSeek. Он работает 24/7, отвечает на все личные сообщения и реагирует на упоминания в группах.
 
 ## Варианты хостинга для постоянной работы
 
-### 1. Railway.app (Рекомендуется - бесплатно)
+### 1. Railway.app (Рекомендуется — есть бесплатный тариф)
 
-1. Зарегистрируйтесь на https://railway.app
-2. Подключите GitHub аккаунт
-3. Создайте репозиторий с кодом бота на GitHub
-4. В Railway создайте новый проект из GitHub
-5. В Environment Variables добавьте:
-   - `TELEGRAM_BOT_TOKEN` = ваш токен бота
-   - `OPENROUTER_API_KEY` = ваш ключ OpenRouter
-6. Railway автоматически развернет бота
+1. Зарегистрируйтесь на https://railway.app (может потребоваться VPN).
+2. Подключите GitHub аккаунт.
+3. Создайте репозиторий с кодом бота на GitHub (или форкните этот).
+4. В Railway создайте новый проект → Deploy from GitHub → выберите ваш репозиторий.
+5. В разделе **Variables** добавьте переменные окружения (см. ниже).
+6. Railway автоматически развернёт бота. После успешного деплоя он сразу запустится.
 
-### 2. Render.com (Бесплатно с ограничениями)
+### 2. Render.com (Бесплатно, но засыпает при бездействии)
 
-1. Зарегистрируйтесь на https://render.com
-2. Создайте Web Service из GitHub репозитория
+1. Зарегистрируйтесь на https://render.com.
+2. Создайте Web Service из GitHub репозитория.
 3. Настройки:
-   - Build Command: `pip install python-telegram-bot aiohttp requests`
-   - Start Command: `python main.py`
-4. Добавьте переменные окружения
+   - **Build Command**: `pip install python-telegram-bot aiohttp requests`
+   - **Start Command**: `python main.py`
+4. Добавьте переменные окружения (см. ниже).
+5. Нажмите Deploy.
 
-### 3. Heroku (Бесплатно до 550 часов/месяц)
+### 3. Heroku (Бесплатный план — 550 часов/месяц)
 
-1. Установите Heroku CLI
-2. Команды:
+1. Установите Heroku CLI.
+2. Выполните команды:
 ```bash
 heroku create your-bot-name
-heroku config:set TELEGRAM_BOT_TOKEN=your_token
-heroku config:set OPENROUTER_API_KEY=your_key
+heroku config:set TELEGRAM_BOT_TOKEN=ваш_токен
+heroku config:set OPENROUTER_API_KEY=ваш_ключ
 git push heroku main
-```
 
-### 4. VPS/Сервер
+4. VPS/Собственный сервер
 
-1. Установите Python 3.11+
-2. Загрузите код бота
-3. Установите зависимости: `pip install python-telegram-bot aiohttp requests`
-4. Настройте переменные окружения
-5. Запустите: `python main.py`
-6. Используйте systemd или screen для фоновой работы
+    Установите Python 3.9+.
 
-## Переменные окружения
+    Загрузите код бота на сервер.
+
+    Установите зависимости: pip install python-telegram-bot aiohttp requests
+
+    Настройте переменные окружения.
+
+    Запустите: python main.py
+
+    Для фоновой работы используйте screen или systemd.
+
+Переменные окружения
 
 Обязательно установите на хостинге:
-- `TELEGRAM_BOT_TOKEN` - токен вашего бота
-- `OPENROUTER_API_KEY` - ключ OpenRouter API
+Переменная	Описание
+TELEGRAM_BOT_TOKEN	Токен вашего Telegram-бота (получить у @BotFather)
+OPENROUTER_API_KEY	Ключ DeepSeek (получить на platform.deepseek.com). Название переменной оставлено для совместимости, но бот использует DeepSeek напрямую.
+Необходимые файлы для развертывания
 
-## Файлы для развертывания
+Убедитесь, что в корне репозитория есть все эти файлы:
 
-- `main.py` - основной файл бота
-- `bot_config.py` - конфигурация
-- `openrouter_client.py` - клиент AI API
-- `message_memory.py` - память сообщений
-- `keep_alive.py` - keep-alive система
-- `Procfile` - для Heroku
-- `Dockerfile` - для Docker
-- `runtime.txt` - версия Python
+    main.py — основной файл с логикой бота
 
-## После развертывания
+    bot_config.py — конфигурация и системный промпт
 
-Бот будет работать постоянно 24/7 и отвечать на:
-- Упоминания слова "Саныч"
-- Ответы на свои сообщения
-- Помнить 200 сообщений в каждом чате
+    openrouter_client.py — клиент для DeepSeek API
+
+    message_memory.py — управление историей чатов
+
+    keep_alive.py — поддержка активности (опционально)
+
+    Procfile — для Heroku
+
+    Dockerfile — для Docker
+
+    runtime.txt — версия Python (например, 3.11)
+
+    README.md — описание проекта
+
+После развертывания
+
+    Личные чаты: Бот отвечает на каждое сообщение, которое вы ему отправляете.
+
+    Групповые чаты: Отвечает только если вы упомянули его по имени (например, @nastanik_dushi_bot) или написали слово «Архитектор».
+
+    Память: Бот помнит последние 20 сообщений в каждом чате, чтобы поддерживать контекст.
+
+    Команды: /start, /help, /clear_memory.
+
+Если бот не отвечает — проверьте логи на хостинге. Обычно ошибки связаны с неправильными токенами или отсутствием баланса на DeepSeek.
