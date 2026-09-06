@@ -30,7 +30,7 @@ class ArchitectBot:
     def __init__(self):
         self.config = BotConfig()
         self.ai_client = OpenRouterClient(self.config.openrouter_api_key)
-        self.memory = MessageMemory(max_messages=self.config.max_history_messages)
+        self.memory = MessageMemory(max_messages_per_chat=self.config.max_history_messages)
         self.bot_username = None
         # В будущем здесь можно хранить персональные данные пользователей
         self.user_data: Dict[int, Dict] = {}  # chat_id -> {birth_date, psychotype, ...}
