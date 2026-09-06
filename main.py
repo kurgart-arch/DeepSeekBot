@@ -3,12 +3,14 @@
 """
 Telegram Bot "Архитектор Судьбы" (DeepSeek API).
 Личные чаты — отвечает на всё; группы — только на упоминание.
+История диалогов и профили пользователей переживают перезапуск (JSON-файлы).
 """
 
+import json
 import logging
 import re
 import threading
-from typing import Optional
+from typing import Dict, Optional
 
 from telegram import Update
 from telegram.ext import (
@@ -31,8 +33,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 TELEGRAM_MSG_LIMIT = 4096  # лимит Telegram на одно сообщение
-# Триггеры в группах — согласованы с текстом /start
-GROUP_KEYWORDS = ("наставник", "архитектор")
+GROUP_KEYWORDS = ("наставник", "архитектор")  # триггеры в группах
 
 
 class ArchitectBot:
@@ -48,18 +49,19 @@ class ArchitectBot:
             timeout=self.config.request_timeout,
         )
 
+        # Память: храним memory_messages (50), в LLM уходит max_history_messages (12).
+        # Хранить больше, чем отправлять, бесплатно — запас нужен для дайджестов
         self.memory = MessageMemory(
-            max_messages_per_chat=self.config.max_history_messages
+            max_messages_per_chat=self.config.memory_messages,
+            persist_path=self.config.memory_file,
         )
         self.bot_username = None
         # Персональные данные: chat_id -> {birth_date, psychotype, session_digest}
-        # Живут в памяти процесса — при перезапуске сбрасываются
-        self.user_data = {}
+        self.user_data = self._load_user_data()
 
     # ---------------- Команды ----------------
 
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик /start"""
         await update.message.reply_text(
             "🧘 Приветствую, искатель!\n\n"
             "Я — твой Архитектор Судьбы. Я не даю готовых ответов — "
@@ -69,13 +71,12 @@ class ArchitectBot:
         )
 
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик /help"""
         help_text = (
             "🧭 <b>Архитектор Судьбы</b> — твой наставник и зеркало.\n\n"
             "<b>Как использовать:</b>\n"
             "• В личных сообщениях я отвечаю на всё, что ты напишешь.\n"
             f"• Я помню последние {self.config.max_history_messages} сообщений "
-            "этого чата.\n\n"
+            "и сохраняю историю между сессиями.\n\n"
             "<b>Команды:</b>\n"
             "/start — начать диалог\n"
             "/help — эта справка\n"
@@ -105,13 +106,14 @@ class ArchitectBot:
         self.user_data.setdefault(chat_id, {})
         self.user_data[chat_id]["birth_date"] = birth_date
         self.user_data[chat_id]["psychotype"] = psychotype
+        self._save_user_data()
+
         await update.message.reply_text(
             f"✅ Записал: дата рождения {birth_date}, психотип «{psychotype}».\n"
             "Теперь я буду учитывать это в наших разговорах."
         )
 
     async def clear_memory_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Очистка памяти чата"""
         chat_id = update.effective_chat.id
         self.memory.clear_chat_memory(chat_id)
         await update.message.reply_text(
@@ -217,7 +219,8 @@ class ArchitectBot:
     async def generate_response(self, chat_id: int, chat_type: str) -> Optional[str]:
         """Сборка сообщений для LLM и вызов клиента"""
         try:
-            history = self.memory.get_chat_messages(chat_id) or []
+            history = self.memory.get_chat_messages(chat_id)
+            # В LLM уходит только окно контекста, а не вся память
             context_history = history[-self.config.max_history_messages:]
 
             messages = [{
@@ -235,7 +238,6 @@ class ArchitectBot:
                     content = msg['text']  # в личке ролей достаточно
                 messages.append({"role": role, "content": content})
 
-            # model, max_tokens, temperature, ретраи и таймаут — внутри клиента
             return await self.ai_client.generate_response(messages)
 
         except Exception as e:
@@ -255,25 +257,46 @@ class ArchitectBot:
             )
         return prompt
 
+    # ---------------- Персистентность профилей ----------------
+
+    def _load_user_data(self) -> Dict[int, Dict]:
+        path = self.config.user_data_file
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            return {int(chat_id): info for chat_id, info in data.items()}
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError, json.JSONDecodeError) as e:
+            logger.error(f"Не удалось загрузить {path}: {e}")
+            return {}
+
+    def _save_user_data(self) -> None:
+        path = self.config.user_data_file
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(
+                    {str(chat_id): info for chat_id, info in self.user_data.items()},
+                    f, ensure_ascii=False,
+                )
+        except OSError as e:
+            logger.error(f"Не удалось сохранить {path}: {e}")
+
     # ---------------- Инфраструктура ----------------
 
     async def error_handler(self, update, context: ContextTypes.DEFAULT_TYPE):
-        """Глобальный обработчик ошибок"""
         logger.error(f"Исключение: {context.error}")
 
     async def post_init(self, application: Application):
-        """Выполняется после запуска: запоминаем username бота"""
         bot_info = await application.bot.get_me()
         self.bot_username = bot_info.username
         logger.info(f"Бот запущен: @{self.bot_username}")
 
     async def post_shutdown(self, application: Application):
-        """Выполняется при остановке: закрываем HTTP-сессию AI-клиента"""
         await self.ai_client.close()
         logger.info("AI-клиент закрыт")
 
     def run(self):
-        """Запуск бота"""
         keep_alive = threading.Thread(target=keep_alive_thread, daemon=True)
         keep_alive.start()
         logger.info("Keep-alive поток запущен")
