@@ -6,18 +6,12 @@ Telegram Bot «Проводник Души» (DeepSeek API).
 Личные чаты — отвечает на всё; группы — на слово-триггер или ответ.
 
 ПАМЯТЬ: история (50 сообщений) — chat_memory.json; профиль, книга уроков,
-фокус недели — user_data.json. Оба файла переживают рестарт и обновление кода.
-Сюцай, личный год, фаза возраста пересчитываются из ДР при каждом запросе.
+якоря, фокус недели, флаг заботы — user_data.json. Переживают рестарт.
 
-ДУГА СЕССИИ: контакт → диагностика → нарастание → кульминация → проживание →
-закрепление. Модель помечает фазу [PHASE: ...]; код считает зависания и общее
-число обменов; 5+ обменов без кульминации — принудительный выталкивающий приказ.
-Лимиты: диагностика ≤ 2 вопросов, всего ≤ 4 вопросов на тему, «что в теле» —
-один раз за сессию и только после кульминации.
-
-Ленивая персонализация: дата рождения перехватывается из разговора,
-остальное модель сохраняет тихими маркерами [SAVE: ...].
-КПТ: детектор словесных ловушек в коде; /rebuild N — пересборка убеждения.
+ДУГА СЕССИИ: контакт → диагностика → нарастание → кульминация →
+бережный режим → закрепление. Лимиты: 2 вопроса диагностики, 4 вопроса
+на тему, «что в теле» — в бережном режиме. 5+ обменов — принудительная
+кульминация. Якоря [ANCHOR: ...], эхо-забота [CARE: ...].
 """
 
 import json
@@ -66,13 +60,13 @@ RU_WEEKDAYS = ('пн', 'вт', 'ср', 'чт', 'пт', 'сб', 'вс')
 
 # Автоперехват даты рождения: ДД.ММ.ГГГГ (разделители . - /)
 DATE_RE = re.compile(r'\b(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{4})\b')
-# Тихие маркеры модели: [SAVE: к=в] [LESSON: т] [FOCUS: т] [PHASE: ф]
-MARKER_RE = re.compile(r'\[\s*(SAVE|LESSON|FOCUS|PHASE)\s*:\s*([^\]]+)\]')
+# Тихие маркеры: [SAVE: к=в] [LESSON: т] [FOCUS: т] [PHASE: ф] [ANCHOR: я] [CARE: т]
+MARKER_RE = re.compile(
+    r'\[\s*(SAVE|LESSON|FOCUS|PHASE|ANCHOR|CARE)\s*:\s*([^\]]+)\]')
 
 SESSION_PHASES = ('контакт', 'диагностика', 'нарастание',
                   'кульминация', 'проживание', 'закрепление')
 
-# Допуск опечаток модели в названиях фаз (транслит, падежи, очепятки)
 PHASE_FIXES = {
     'диагностике': 'диагностика', 'диагностику': 'диагностика',
     'диагностека': 'диагностика', 'диагнотсика': 'диагностика',
@@ -130,7 +124,6 @@ COGNITIVE_PATTERNS = [
 
 
 def detect_patterns(text: str, limit: int = 2) -> List[str]:
-    """Максимум limit подсказок, чтобы не заваливать модель."""
     found = []
     for rx, hint in COGNITIVE_PATTERNS:
         if rx.search(text):
@@ -158,8 +151,6 @@ class SoulGuideBot:
         )
         self.bot_username = None
         self.user_data = self._load_user_data()
-        # Фаза сессии: {'phase': ..., 'same': N, 'turns': N, 'force': bool}.
-        # Живёт в памяти процесса; сброс при /session, /morning, /evening.
         self.session_state: Dict[int, Dict] = {}
 
     # ---------------- Команды ----------------
@@ -178,10 +169,11 @@ class SoulGuideBot:
             "🔮 <b>Что я умею</b>\n"
             "• Сессии — от пары точных вопросов до момента истины, когда "
             "вдруг видно самое главное\n"
+            "• Бережно вести через вскрытую боль: техники успокоения, "
+            "якоря — короткие фразы новой силы\n"
             "• Твои числа — напиши дату рождения прямо в разговоре, и я "
             "точно посчитаю психоматрицу (Сюцай), личный год и фазу "
-            "возраста — кодом, без фантазий. Дизайн Человека узнаешь в "
-            "любом калькуляторе и впишешь — я запомню\n"
+            "возраста — кодом, без фантазий\n"
             "• Книга уроков — убеждения и стратегии, которые мы нашли "
             "вместе; их можно пересобрать и закрыть\n"
             "• Ритм дня — утром карта с темой и одним действием, вечером "
@@ -195,7 +187,7 @@ class SoulGuideBot:
             "перезапуск\n\n"
             "💬 <b>Важно</b>\n"
             "Я не врач и не заменяю психотерапевта. Если станет тяжело — "
-            "скажи прямо, притормозим.\n\n"
+            "скажи прямо: остановимся, подышим, вернёмся позже.\n\n"
             "А теперь — самое главное. Что происходит в твоей жизни "
             "прямо сейчас? 🌱",
             parse_mode="HTML"
@@ -208,10 +200,12 @@ class SoulGuideBot:
             "<b>🎧 Сессия:</b>\n"
             "/session тема — целая сессия: от пары точных вопросов до "
             "момента истины\n\n"
+            "<b>⚓ Якоря:</b>\n"
+            "/anchors — твои короткие новые убеждения\n"
+            "/anchor фраза — добавить якорь вручную\n\n"
             "<b>☀️🌙 Ритм дня:</b>\n"
             "/morning — карта дня: тема, зеркало, одно действие\n"
-            "/evening — разбор дня: три вопроса (в воскресенье — и фокус "
-            "недели)\n\n"
+            "/evening — разбор дня: три вопроса (в вс — и фокус недели)\n\n"
             "<b>📖 Книга уроков:</b>\n"
             "/lessons — найденные убеждения и стратегии\n"
             "/rebuild N — пошаговая пересборка убеждения\n"
@@ -229,14 +223,12 @@ class SoulGuideBot:
             "последних сообщений; история, профиль и уроки переживают "
             "перезапуск.\n\n"
             "В группах зови меня словом «проводник».\n\n"
-            "Я не даю советов и не ставлю диагнозов — только вопросы, "
-            "честные наблюдения и маленькие действия. Если тяжело — "
-            "скажи, притормозим."
+            "Я не даю советов и не ставлю диагнозов. Станет тяжело — "
+            "скажи «стоп»: остановимся и подышим."
         )
         await update.message.reply_text(help_text, parse_mode="HTML")
 
     async def set_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """/set ключ значение — ручное заполнение (ускорение ленивого сбора)"""
         chat_id = update.effective_chat.id
         args = context.args
 
@@ -312,12 +304,55 @@ class SoulGuideBot:
         lessons = info.get('lessons') or []
         if lessons:
             lines.append(f"\n📖 Уроков в книге: {len(lessons)} (список: /lessons)")
+        anchors = info.get('anchors') or []
+        if anchors:
+            lines.append(f"⚓ Якорей: {len(anchors)} (список: /anchors)")
         focus = info.get('focus_week') or {}
         if focus.get('theme'):
             lines.append(f"🎯 Фокус недели: «{focus['theme']}»")
 
         lines.append("\n(Сюцай и нумерология — рамки для размышления, не факты.)")
         await update.message.reply_text("\n".join(lines))
+
+    async def anchors_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        chat_id = update.effective_chat.id
+        info = self.user_data.get(chat_id) or {}
+        anchors = info.get('anchors') or []
+
+        if not anchors:
+            await update.message.reply_text(
+                "⚓ Якорей пока нет.\n\n"
+                "Якорь — короткое новое убеждение, твоими словами (3–7 слов), "
+                "которое возвращает в сильное состояние: «я справляюсь», "
+                "«моя нежность — не слабость». Они рождаются в сессиях "
+                "после освобождения от старого. Добавить вручную: "
+                "/anchor фраза"
+            )
+            return
+
+        lines = ["⚓ Твои якоря:"]
+        for a in anchors:
+            lines.append(f"• «{a['text']}» (с {a.get('created', '?')})")
+        lines.append("\nПроизнеси вслух тот, что откликается сейчас — "
+                     "с рукой на груди. /anchor фраза — добавить новый.")
+        await update.message.reply_text("\n".join(lines))
+
+    async def anchor_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """/anchor фраза — добавить якорь вручную"""
+        chat_id = update.effective_chat.id
+        phrase = " ".join(context.args).strip() if context.args else ""
+        if not phrase:
+            await update.message.reply_text(
+                "Формат: /anchor короткая фраза.\n"
+                "Например: /anchor Я справляюсь с трудным"
+            )
+            return
+        self._add_anchor(chat_id, phrase)
+        await update.message.reply_text(
+            f"⚓ Якорь сохранён: «{phrase}».\n"
+            "Произнеси его вслух 2–3 раза, рука на груди — так он "
+            "закрепляется в теле."
+        )
 
     async def lessons_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
@@ -347,7 +382,6 @@ class SoulGuideBot:
         await update.message.reply_text("\n".join(lines))
 
     async def lesson_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """/lesson текст — вручную добавить урок (страховка от маркеров)"""
         chat_id = update.effective_chat.id
         title = " ".join(context.args).strip() if context.args else ""
         if not title:
@@ -423,7 +457,6 @@ class SoulGuideBot:
         await update.message.reply_text(f"🎯 Фокус недели: «{theme}»")
 
     async def rebuild_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """/rebuild N — пошаговая пересборка убеждения (урока N)"""
         chat_id = update.effective_chat.id
         lessons = (self.user_data.get(chat_id) or {}).get('lessons') or []
         if not context.args or not context.args[0].isdigit():
@@ -460,8 +493,8 @@ class SoulGuideBot:
         self.memory.clear_chat_memory(chat_id)
         self.session_state.pop(chat_id, None)
         await update.message.reply_text(
-            "🧹 Память разговора очищена. Книга уроков и профиль остались. "
-            "Начнём с чистого листа."
+            "🧹 Память разговора очищена. Книга уроков, якоря и профиль "
+            "остались. Начнём с чистого листа."
         )
 
     # ---------------- Ритуалы и сессия ----------------
@@ -473,7 +506,7 @@ class SoulGuideBot:
         username = ((user.username or user.first_name or "Искатель")
                     if user else "Искатель")
 
-        self.session_state.pop(chat_id, None)  # новый день — новая дуга
+        self.session_state.pop(chat_id, None)
 
         self.memory.add_message(chat_id, {
             'user_id': user.id if user else 0,
@@ -519,7 +552,7 @@ class SoulGuideBot:
                     if user else "Искатель")
         topic = " ".join(context.args).strip() if context.args else ""
 
-        self.session_state.pop(chat_id, None)  # свежая дуга
+        self.session_state.pop(chat_id, None)
 
         self.memory.add_message(chat_id, {
             'user_id': user.id if user else 0,
@@ -559,7 +592,7 @@ class SoulGuideBot:
                     profile['name'] = user.first_name
                     self._save_user_data()
 
-            # 1. Отвечать ли (по исходному тексту, до чистки)
+            # 1. Отвечать ли
             should_respond = False
             if chat_type == 'private':
                 should_respond = True
@@ -577,7 +610,7 @@ class SoulGuideBot:
                 if should_respond:
                     logger.info(f"Group mention in chat {chat_id}")
 
-            # 2. Вырезаем @username бота — чистый промт
+            # 2. Вырезаем @username бота
             text = raw_text
             if self.bot_username:
                 text = re.sub(
@@ -589,10 +622,10 @@ class SoulGuideBot:
             if not text:
                 return
 
-            # 3. Автоперехват даты рождения (личка, ещё не известна)
+            # 3. Автоперехват даты рождения
             self._try_capture_birth(chat_id, text, chat_type)
 
-            # 4. Память: чистый текст (подсказка паттерна туда не попадает)
+            # 4. Память
             self.memory.add_message(chat_id, {
                 'user_id': user.id,
                 'username': username,
@@ -606,14 +639,14 @@ class SoulGuideBot:
 
             await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
-            # 5. Детектор ловушек: подсказка модели в последний user-текст
+            # 5. Детектор ловушек
             pattern_hint = detect_patterns(text)
             if pattern_hint:
                 text_for_model = f"{text}\n[Паттерн: {'; '.join(pattern_hint)}]"
             else:
                 text_for_model = text
 
-            # 6. Генерация + разбор маркеров + ответ
+            # 6. Генерация + маркеры + ответ
             response = await self.generate_response(
                 chat_id, chat_type, user_text=text_for_model
             )
@@ -631,9 +664,6 @@ class SoulGuideBot:
     # ---------------- Ленивый сбор данных ----------------
 
     def _try_capture_birth(self, chat_id: int, text: str, chat_type: str) -> bool:
-        """Тихо ловит ДД.ММ.ГГГГ в личке, если ДР ещё не известен.
-        Защита: только личка, только впервые, валидная дата,
-        год в прошлом, возраст >= 5."""
         if chat_type != 'private':
             return False
         info = self.user_data.get(chat_id)
@@ -665,7 +695,7 @@ class SoulGuideBot:
         return True
 
     def _extract_markers(self, text: str, chat_id: int) -> Tuple[str, List[str]]:
-        """Вырезает [SAVE/LESSON/FOCUS/PHASE]-маркеры, сохраняет данные.
+        """Вырезает маркеры, сохраняет данные.
         Возвращает чистый текст и строки подтверждения пользователю."""
         confirms: List[str] = []
 
@@ -697,8 +727,24 @@ class SoulGuideBot:
                     self._set_focus(chat_id, theme)
                     confirms.append(f"🎯 Фокус недели: «{theme}»")
 
+            elif kind == 'ANCHOR':
+                phrase = body.strip(' «»"\'')
+                if phrase:
+                    self._add_anchor(chat_id, phrase)
+                    confirms.append(f"⚓ Якорь сохранён: «{phrase}»")
+
+            elif kind == 'CARE':
+                topic = body.strip(' «»"\'')
+                if topic:
+                    self.user_data.setdefault(chat_id, {})['care'] = {
+                        'topic': topic,
+                        'set_at': datetime.now().strftime('%d.%m %H:%M'),
+                    }
+                    self._save_user_data()
+                    confirms.append(
+                        "🌱 Завтра спрошу, как ты. Обещаю.")
+
             elif kind == 'PHASE':
-                # Служебный маркер: пользователю не показываем
                 phase = body.strip().lower().rstrip('.')
                 phase = PHASE_FIXES.get(phase, phase)
                 if phase in SESSION_PHASES:
@@ -720,10 +766,17 @@ class SoulGuideBot:
         })
         self._save_user_data()
 
+    def _add_anchor(self, chat_id: int, phrase: str) -> None:
+        anchors = self.user_data.setdefault(chat_id, {}).setdefault('anchors', [])
+        if any(a['text'].lower() == phrase.lower() for a in anchors):
+            return
+        anchors.append({
+            'text': phrase,
+            'created': datetime.now().strftime('%d.%m'),
+        })
+        self._save_user_data()
+
     def _update_phase(self, chat_id: int, phase: str) -> None:
-        """Счётчик зависаний + общий счётчик обменов в теме.
-        «Контакт» = новая тема: счётчик обменов обнуляется.
-        5+ обменов без кульминации — принудительный приказ сверху."""
         st = self.session_state.get(chat_id) or {}
         turns = 1 if phase == 'контакт' else st.get('turns', 0) + 1
         same = st.get('same', 0) + 1 if st.get('phase') == phase else 1
@@ -752,7 +805,6 @@ class SoulGuideBot:
             history = self.memory.get_chat_messages(chat_id)
             context_history = history[-self.config.max_history_messages:]
 
-            # Последнее user-сообщение — с подсказкой о паттернах (если есть)
             if user_text and context_history and not context_history[-1]['is_bot']:
                 context_history = context_history[:-1] + [
                     {**context_history[-1], 'text': user_text}
@@ -806,6 +858,13 @@ class SoulGuideBot:
             for l in finished:
                 data.append(f"  {l['id']}. [проработан] «{l['title']}»")
 
+        anchors = (info.get('anchors') or [])[-3:]
+        if anchors:
+            data.append("— ЯКОРЯ (новые убеждения; напоминай по одному, "
+                        "в уместный момент):")
+            for a in anchors:
+                data.append(f"  ⚓ «{a['text']}»")
+
         focus = info.get('focus_week') or {}
         if focus.get('theme'):
             data.append(
@@ -813,6 +872,15 @@ class SoulGuideBot:
                 f"«{focus['theme']}»")
         else:
             data.append("— Фокус недели: не задан")
+
+        care = info.get('care')
+        if care:
+            data.append(
+                f"— ⚠️ БЕРЕЖНЫЙ РЕЖИМ: недавно вскрыта глубокая тема "
+                f"«{care.get('topic', '')}». Начни этот ответ одной короткой "
+                "фразой заботы о самочувствии; при уместности напомни один "
+                "якорь; затем продолжай по ситуации. Если человек в порядке — "
+                "просто дальше по разговору.")
 
         # Фаза сессии + жёсткое анти-зацикливание
         st = self.session_state.get(chat_id)
@@ -824,7 +892,8 @@ class SoulGuideBot:
                 data.append(
                     "— ПРЕДОХРАНИТЕЛЬ: тема идёт 5+ обменов. Следующий "
                     "ответ — кульминация: одна плотная формулировка «в "
-                    "точку», БЕЗ вопросов. Затем проживание и закрепление.")
+                    "точку», БЕЗ вопросов. Затем бережный режим и "
+                    "закрепление.")
             elif st.get('same', 1) >= 2 and st['phase'] == 'контакт':
                 data.append(
                     "— ЗАВИСАНИЕ: контакт затянут. Следующий ответ — "
@@ -832,8 +901,7 @@ class SoulGuideBot:
             elif st.get('same', 1) >= 2 and st['phase'] == 'диагностика':
                 data.append(
                     "— ЛИМИТ ДИАГНОСТИКИ ИСЧЕРПАН: вопросы запрещены. "
-                    "Следующий ответ — кульминация: одна плотная "
-                    "формулировка «в точку».")
+                    "Следующий ответ — кульминация.")
             elif st.get('same', 1) >= 2 and st['phase'] == 'нарастание':
                 data.append(
                     "— ЗАВИСАНИЕ: материала достаточно. Следующий ответ — "
@@ -858,7 +926,7 @@ class SoulGuideBot:
             blocks.append(MORNING_PROMPT)
         elif mode == 'evening':
             blocks.append(EVENING_PROMPT)
-            if now.weekday() == 6:  # воскресенье
+            if now.weekday() == 6:
                 blocks.append(SUNDAY_EVENING_ADD)
         elif mode == 'rebuild':
             blocks.append(REBUILD_PROMPT)
@@ -869,13 +937,16 @@ class SoulGuideBot:
 
     async def _process_and_reply(self, message, chat_id: int,
                                  response: Optional[str]) -> None:
-        """Маркеры → сохранение; чистый текст → пользователю → в память."""
+        """Маркеры → сохранение; чистый текст → пользователю → в память.
+        Флаг заботы (care) потребляется первым же ответом — кроме случая,
+        когда этим же ответом модель поставила новый [CARE]."""
         if not response:
             await message.reply_text(
                 "⚠️ Не получилось сформировать ответ. Попробуй ещё раз."
             )
             return
 
+        old_care = (self.user_data.get(chat_id) or {}).get('care')
         clean, confirms = self._extract_markers(response, chat_id)
         if not clean:
             if confirms:
@@ -892,7 +963,6 @@ class SoulGuideBot:
         for i in range(0, len(out), TELEGRAM_MSG_LIMIT):
             sent = await message.reply_text(out[i:i + TELEGRAM_MSG_LIMIT])
 
-        # В память — только чистый текст (маркеры не возвращаются в историю)
         self.memory.add_message(chat_id, {
             'user_id': 0,
             'username': self.bot_username or 'Проводник',
@@ -900,6 +970,13 @@ class SoulGuideBot:
             'timestamp': (sent.date if sent else message.date).isoformat(),
             'is_bot': True,
         })
+
+        # Эхо-забота сработала этим ответом — флаг снимаем.
+        # Если модель этим же ответом поставила НОВЫЙ [CARE] — он остаётся.
+        info = self.user_data.get(chat_id) or {}
+        if old_care and info.get('care') == old_care:
+            info.pop('care', None)
+            self._save_user_data()
 
     # ---------------- Персистентность ----------------
 
@@ -961,6 +1038,8 @@ class SoulGuideBot:
         application.add_handler(CommandHandler("evening", self.evening_command))
         application.add_handler(CommandHandler("set", self.set_command))
         application.add_handler(CommandHandler("profile", self.profile_command))
+        application.add_handler(CommandHandler("anchors", self.anchors_command))
+        application.add_handler(CommandHandler("anchor", self.anchor_command))
         application.add_handler(CommandHandler("lessons", self.lessons_command))
         application.add_handler(CommandHandler("lesson", self.lesson_command))
         application.add_handler(CommandHandler("done", self.done_command))
