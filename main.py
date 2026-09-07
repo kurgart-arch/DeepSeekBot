@@ -442,7 +442,7 @@ class SoulGuideBot:
         self.memory.add_message(chat_id, {
             'user_id': user.id if user else 0,
             'username': username,
-            'text': '🌙 Вечерний ритual'
+            'text': '🌙 Вечерний ритual',
             'timestamp': message.date.isoformat(),
             'is_bot': False,
         })
