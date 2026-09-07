@@ -5,13 +5,17 @@ Telegram Bot «Проводник Души» (DeepSeek API).
 
 Личные чаты — отвечает на всё; группы — на слово-триггер или ответ.
 
-Ленивая персонализация: без анкет. Дата рождения перехватывается из
-разговора, остальное модель сохраняет тихими маркерами [SAVE: ...].
-Точные расчёты (Сюцай, личный год, фаза возраста) — кодом в calculations.py.
-Книга уроков, фокус недели, профиль — в user_data.json (переживают рестарт).
+ПАМЯТЬ: история (50 сообщений) — chat_memory.json; профиль, книга уроков,
+фокус недели — user_data.json. Оба переживают рестарт и обновление кода.
+Сюцай, личный год, фаза возраста считаются заново из ДР при каждом запросе.
 
-КПТ: детектор словесных ловушек в коде (подсказка модели в последний
-user-текст), /rebuild N — пошаговая пересборка убеждения.
+ДУГА СЕССИИ: контакт → диагностика → нарастание → кульминация →
+проживание → закрепление. Модель помечает фазу [PHASE: ...], код считает
+зависания и подталкивает к кульминации. /session — полная сессия по запросу.
+
+Ленивая персонализация: дата рождения перехватывается из разговора,
+остальное модель сохраняет тихими маркерами [SAVE: ...].
+КПТ: детектор словесных ловушек в коде; /rebuild N — пересборка убеждения.
 """
 
 import json
@@ -37,6 +41,7 @@ from bot_config import (
     EVENING_PROMPT,
     SUNDAY_EVENING_ADD,
     REBUILD_PROMPT,
+    SESSION_PROMPT,
 )
 from calculations import calc_summary, parse_birth_date, build_calc_lines
 from openrouter_client import OpenRouterClient
@@ -59,8 +64,11 @@ RU_WEEKDAYS = ('пн', 'вт', 'ср', 'чт', 'пт', 'сб', 'вс')
 
 # Автоперехват даты рождения: ДД.ММ.ГГГГ (разделители . - /)
 DATE_RE = re.compile(r'\b(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{4})\b')
-# Тихие маркеры модели: [SAVE: ключ=значение] [LESSON: тема] [FOCUS: тема]
-MARKER_RE = re.compile(r'\[\s*(SAVE|LESSON|FOCUS)\s*:\s*([^\]]+)\]')
+# Тихие маркеры модели: [SAVE: к=в] [LESSON: т] [FOCUS: т] [PHASE: ф]
+MARKER_RE = re.compile(r'\[\s*(SAVE|LESSON|FOCUS|PHASE)\s*:\s*([^\]]+)\]')
+
+SESSION_PHASES = ('контакт', 'диагностика', 'нарастание',
+                  'кульминация', 'проживание', 'закрепление')
 
 PROFILE_FIELDS = {
     'birth': 'birth_date', 'др': 'birth_date', 'дата': 'birth_date',
@@ -137,6 +145,9 @@ class SoulGuideBot:
         )
         self.bot_username = None
         self.user_data = self._load_user_data()
+        # Фаза сессии (анти-зацикливание): {'phase': ..., 'same': N}.
+        # Живёт в памяти процесса: после рестарта — новая дуга. Намеренно.
+        self.session_state: Dict[int, Dict] = {}
 
     # ---------------- Команды ----------------
 
@@ -147,13 +158,16 @@ class SoulGuideBot:
             "зеркала, помогаю малыми шагами выйти из застоя. Готовых решений "
             "не даю — ответы находишь ты, я задаю точные вопросы.\n\n"
             "Просто расскажи, что сейчас происходит — с этого и начнём.\n\n"
-            "По желанию: /morning — карта дня · /evening — разбор дня · "
+            "По желанию: /session тема — целая сессия · /morning — карта дня · "
             "/help — всё о моей работе"
         )
 
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         help_text = (
             "🕯 <b>Проводник Души</b> — наставник, зеркало, ежедневный навигатор.\n\n"
+            "<b>Сессия:</b>\n"
+            "/session тема — полная сессия по запросу: от пары точных вопросов "
+            "до момента истины\n\n"
             "<b>Ритм:</b>\n"
             "/morning — карта дня: тема, зеркало, одно действие\n"
             "/evening — разбор дня: три вопроса (в воскресенье — и фокус недели)\n\n"
@@ -170,7 +184,7 @@ class SoulGuideBot:
             "Дату рождения можно просто написать в разговоре — подхвачу сам.\n\n"
             "<b>Память:</b>\n"
             f"/clear_memory — с чистого листа (вижу {self.config.max_history_messages} "
-            "последних сообщений; история и профиль переживают перезапуск)\n\n"
+            "последних сообщений; история, профиль и уроки переживают перезапуск)\n\n"
             "<b>В группах</b> зови меня словом «проводник».\n\n"
             "Я не даю советов и не ставлю диагнозов — только вопросы, "
             "честные наблюдения и маленькие действия."
@@ -270,7 +284,8 @@ class SoulGuideBot:
                 "📖 Книга уроков пуста.\n\n"
                 "Уроки появляются, когда в разговоре вскрывается ложное "
                 "убеждение или неработающая стратегия и ты подтверждаешь: "
-                "«да, это про меня». Начни: расскажи, что сейчас происходит."
+                "«да, это про меня». Начни: /session или просто расскажи, "
+                "что сейчас происходит."
             )
             return
 
@@ -389,12 +404,13 @@ class SoulGuideBot:
     async def clear_memory_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
         self.memory.clear_chat_memory(chat_id)
+        self.session_state.pop(chat_id, None)
         await update.message.reply_text(
             "🧹 Память разговора очищена. Книга уроков и профиль остались. "
             "Начнём с чистого листа."
         )
 
-    # ---------------- Ритуалы ----------------
+    # ---------------- Ритуалы и сессия ----------------
 
     async def morning_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         message = update.message
@@ -426,7 +442,7 @@ class SoulGuideBot:
         self.memory.add_message(chat_id, {
             'user_id': user.id if user else 0,
             'username': username,
-            'text': '🌙 Вечерний ритуал',
+            'text': '🌙 Вечерний ритual'
             'timestamp': message.date.isoformat(),
             'is_bot': False,
         })
@@ -434,6 +450,29 @@ class SoulGuideBot:
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
         response = await self.generate_response(chat_id, message.chat.type,
                                                 mode='evening')
+        await self._process_and_reply(message, chat_id, response)
+
+    async def session_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """🎧 /session [тема] — полная сессия по запросу"""
+        message = update.message
+        chat_id = update.effective_chat.id
+        user = update.effective_user
+        username = ((user.username or user.first_name or "Искатель")
+                    if user else "Искатель")
+        topic = " ".join(context.args).strip() if context.args else ""
+
+        self.session_state.pop(chat_id, None)  # свежая дуга
+
+        self.memory.add_message(chat_id, {
+            'user_id': user.id if user else 0,
+            'username': username,
+            'text': f'🎧 Сессия: {topic}' if topic else '🎧 Сессия',
+            'timestamp': message.date.isoformat(),
+            'is_bot': False,
+        })
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+        response = await self.generate_response(chat_id, message.chat.type,
+                                                mode='session')
         await self._process_and_reply(message, chat_id, response)
 
     # ---------------- Сообщения ----------------
@@ -568,7 +607,7 @@ class SoulGuideBot:
         return True
 
     def _extract_markers(self, text: str, chat_id: int) -> Tuple[str, List[str]]:
-        """Вырезает [SAVE/LESSON/FOCUS]-маркеры, сохраняет данные.
+        """Вырезает [SAVE/LESSON/FOCUS/PHASE]-маркеры, сохраняет данные.
         Возвращает чистый текст и строки подтверждения пользователю."""
         confirms: List[str] = []
 
@@ -600,6 +639,12 @@ class SoulGuideBot:
                     self._set_focus(chat_id, theme)
                     confirms.append(f"🎯 Фокус недели: «{theme}»")
 
+            elif kind == 'PHASE':
+                # Служебный маркер: пользователю не показываем
+                phase = body.strip().lower()
+                if phase in SESSION_PHASES:
+                    self._update_phase(chat_id, phase)
+
         clean = MARKER_RE.sub('', text)
         clean = re.sub(r'\n{3,}', '\n\n', clean).rstrip()
         return clean, confirms
@@ -615,6 +660,15 @@ class SoulGuideBot:
             'created': datetime.now().strftime('%d.%m'),
         })
         self._save_user_data()
+
+    def _update_phase(self, chat_id: int, phase: str) -> None:
+        """Считаем зависания: сколько реплик подряд в одной фазе."""
+        st = self.session_state.get(chat_id)
+        if st and st['phase'] == phase:
+            st['same'] += 1
+        else:
+            st = {'phase': phase, 'same': 1}
+        self.session_state[chat_id] = st
 
     def _set_focus(self, chat_id: int, theme: str) -> None:
         self.user_data.setdefault(chat_id, {})['focus_week'] = {
@@ -695,6 +749,21 @@ class SoulGuideBot:
         else:
             data.append("— Фокус недели: не задан")
 
+        # Фаза сессии + детектор зависания (анти-зацикливание в коде)
+        st = self.session_state.get(chat_id)
+        if st:
+            phase_line = f"— Фаза сессии: {st['phase']}"
+            if st['same'] >= 2 and st['phase'] == 'контакт':
+                phase_line += " (зависание: переходи к диагностике)"
+            elif st['same'] >= 3 and st['phase'] in ('диагностика', 'нарастание'):
+                phase_line += (" (зависание: материала достаточно — "
+                               "к кульминации, без новых вопросов)")
+            elif st['same'] >= 2 and st['phase'] == 'проживание':
+                phase_line += " (пора к закреплению)"
+            data.append(phase_line)
+        else:
+            data.append("— Фаза сессии: не отслежена (начни с контакта)")
+
         missing = [PROFILE_LABELS[f] for f in ASKABLE if not info.get(f)]
         if missing:
             data.append(f"— Ещё не знаю: {', '.join(missing)} "
@@ -713,6 +782,8 @@ class SoulGuideBot:
                 blocks.append(SUNDAY_EVENING_ADD)
         elif mode == 'rebuild':
             blocks.append(REBUILD_PROMPT)
+        elif mode == 'session':
+            blocks.append(SESSION_PROMPT)
 
         return "\n".join(blocks)
 
@@ -803,6 +874,7 @@ class SoulGuideBot:
 
         application.add_handler(CommandHandler("start", self.start_command))
         application.add_handler(CommandHandler("help", self.help_command))
+        application.add_handler(CommandHandler("session", self.session_command))
         application.add_handler(CommandHandler("morning", self.morning_command))
         application.add_handler(CommandHandler("evening", self.evening_command))
         application.add_handler(CommandHandler("set", self.set_command))
