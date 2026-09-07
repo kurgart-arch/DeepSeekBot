@@ -1,21 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Telegram Bot «Проводник Души» (DeepSeek API).
+Telegram Bot «Проводник Души» (DeepSeek API). Версия 6.
 
 Личные чаты — отвечает на всё; группы — на слово-триггер или ответ.
 
 ПАМЯТЬ: история (50 сообщений) — chat_memory.json; профиль, книга уроков,
-якоря, фокус недели, флаг заботы — user_data.json. Переживают рестарт.
+якоря, фокус, дайджест — user_data.json. При старте бот пересобирает
+дайджест (Память сессий) из истории — возвращается в контекст, а не
+начинает с нуля. /digest — пересборка вручную.
 
-ДУГА СЕССИИ: контакт → диагностика → нарастание → кульминация →
-бережный режим → закрепление. Лимиты: 2 вопроса диагностики, 4 вопроса
-на тему, «что в теле» — в бережном режиме. 5+ обменов — принудительная
-кульминация. Якоря [ANCHOR: ...], эхо-забота [CARE: ...].
+ДУГА: контакт → диагностика → нарастание → кульминация → бережный
+режим → закрепление. Лимиты: 2 вопроса диагностики, 4 на тему, «что в
+теле» — только в бережном режиме. 5+ обменов — принудительная кульминация.
+База: доверие и искренность; цель — внутренняя опора.
+Формат: Markdown от модели вычищается (strip_markdown); индикатор
+«печатает…» живёт всю генерацию; мягкая пауза перед ответом.
 """
 
+import asyncio
 import json
 import logging
+import random
 import re
 import threading
 import time
@@ -38,6 +44,7 @@ from bot_config import (
     SUNDAY_EVENING_ADD,
     REBUILD_PROMPT,
     SESSION_PROMPT,
+    REENTRY_PROMPT,
 )
 from calculations import calc_summary, parse_birth_date, build_calc_lines
 from openrouter_client import OpenRouterClient
@@ -60,7 +67,7 @@ RU_WEEKDAYS = ('пн', 'вт', 'ср', 'чт', 'пт', 'сб', 'вс')
 
 # Автоперехват даты рождения: ДД.ММ.ГГГГ (разделители . - /)
 DATE_RE = re.compile(r'\b(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{4})\b')
-# Тихие маркеры: [SAVE: к=в] [LESSON: т] [FOCUS: т] [PHASE: ф] [ANCHOR: я] [CARE: т]
+# Тихие маркеры: [SAVE] [LESSON] [FOCUS] [PHASE] [ANCHOR] [CARE]
 MARKER_RE = re.compile(
     r'\[\s*(SAVE|LESSON|FOCUS|PHASE|ANCHOR|CARE)\s*:\s*([^\]]+)\]')
 
@@ -133,6 +140,20 @@ def detect_patterns(text: str, limit: int = 2) -> List[str]:
     return found
 
 
+def strip_markdown(text: str) -> str:
+    """Вычищает LLM-разметку: **жирный**, *курсив*, `код`, ## заголовки,
+    --- разделители. Telegram получает чистый текст без звёздочек.
+    Одиночные _ не трогаем: они бывают в именах файлов (user_data.json)."""
+    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
+    text = re.sub(r'__(.+?)__', r'\1', text)
+    text = re.sub(r'(?<!\*)\*([^*\n]+?)\*(?!\*)', r'\1', text)
+    text = re.sub(r'`([^`\n]+?)`', r'\1', text)
+    text = re.sub(r'^#{1,6}\s+', '', text, flags=re.M)
+    text = re.sub(r'^\s*[-*_]{3,}\s*$', '', text, flags=re.M)
+    text = re.sub(r' {2,}', ' ', text)
+    return text.strip()
+
+
 class SoulGuideBot:
     def __init__(self):
         self.config = BotConfig()
@@ -152,6 +173,7 @@ class SoulGuideBot:
         self.bot_username = None
         self.user_data = self._load_user_data()
         self.session_state: Dict[int, Dict] = {}
+        self._app = None  # ссылка на Application (для индикатора печати)
 
     # ---------------- Команды ----------------
 
@@ -171,6 +193,8 @@ class SoulGuideBot:
             "вдруг видно самое главное\n"
             "• Бережно вести через вскрытую боль: техники успокоения, "
             "якоря — короткие фразы новой силы\n"
+            "• Помню наши разговоры — и после перезапуска возвращаюсь "
+            "в контекст, а не начинаю с нуля\n"
             "• Твои числа — напиши дату рождения прямо в разговоре, и я "
             "точно посчитаю психоматрицу (Сюцай), личный год и фазу "
             "возраста — кодом, без фантазий\n"
@@ -180,11 +204,9 @@ class SoulGuideBot:
             "три вопроса для разбора\n\n"
             "🤝 <b>Как со мной работать</b>\n"
             "• Просто напиши, что сейчас происходит — этого достаточно "
-            "для старта\n"
+            "для старта. Здесь можно как есть.\n"
             "• Хочешь глубоко — /session и тема\n"
-            "• Хочешь ритм — /morning и /evening\n"
-            "• Я помню наши разговоры: история и твой профиль переживают "
-            "перезапуск\n\n"
+            "• Хочешь ритм — /morning и /evening\n\n"
             "💬 <b>Важно</b>\n"
             "Я не врач и не заменяю психотерапевта. Если станет тяжело — "
             "скажи прямо: остановимся, подышим, вернёмся позже.\n\n"
@@ -212,10 +234,12 @@ class SoulGuideBot:
             "/done N — пометить урок проработанным\n"
             "/focus N или /focus тема — фокус недели\n"
             "/lesson текст — добавить урок вручную\n\n"
-            "<b>📋 Данные:</b>\n"
+            "<b>📋 Данные и память:</b>\n"
             "/set ключ значение — birth, пол, psychotype, hd, соляр, "
             "хронотип, кнопка, запрос\n"
             "/profile — всё, что я о тебе знаю\n"
+            "/digest — пересобрать память сессий (что я помню о наших "
+            "разговорах)\n"
             "Дату рождения можно просто написать в разговоре — "
             "подхвачу сам.\n\n"
             "<b>🧹 Память:</b>\n"
@@ -301,6 +325,9 @@ class SoulGuideBot:
             for line in build_calc_lines(info['birth_date']):
                 lines.append(f"• {line}")
 
+        if info.get('digest'):
+            lines.append("\n🧠 Память сессий: собрана (обновить: /digest)")
+
         lessons = info.get('lessons') or []
         if lessons:
             lines.append(f"\n📖 Уроков в книге: {len(lessons)} (список: /lessons)")
@@ -313,6 +340,32 @@ class SoulGuideBot:
 
         lines.append("\n(Сюцай и нумерология — рамки для размышления, не факты.)")
         await update.message.reply_text("\n".join(lines))
+
+    async def digest_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """🧠 /digest — пересобрать память сессий из истории чата"""
+        chat_id = update.effective_chat.id
+        history = self.memory.get_chat_messages(chat_id)
+        if len(history) < 4:
+            await update.message.reply_text(
+                "🧠 История пока короткая — памяти собирать не из чего. "
+                "Поговорим — и вернись."
+            )
+            return
+
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+        digest = await self._build_digest(chat_id)
+        if digest:
+            self.user_data.setdefault(chat_id, {})['digest'] = digest
+            self._save_user_data()
+            preview = digest[:800] + ("…" if len(digest) > 800 else "")
+            await update.message.reply_text(
+                "🧠 Память сессий обновлена. Вот что я держу в уме:\n\n"
+                + preview
+            )
+        else:
+            await update.message.reply_text(
+                "⚠️ Не удалось собрать память. Попробуй позже: /digest"
+            )
 
     async def anchors_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
@@ -338,7 +391,6 @@ class SoulGuideBot:
         await update.message.reply_text("\n".join(lines))
 
     async def anchor_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """/anchor фраза — добавить якорь вручную"""
         chat_id = update.effective_chat.id
         phrase = " ".join(context.args).strip() if context.args else ""
         if not phrase:
@@ -483,18 +535,21 @@ class SoulGuideBot:
             'is_bot': False,
         })
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-        response = await self.generate_response(
-            chat_id, update.message.chat.type, mode='rebuild'
-        )
+        response = await self._generate_with_alive(
+            update.message, chat_id, mode='rebuild')
         await self._process_and_reply(update.message, chat_id, response)
 
     async def clear_memory_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
         self.memory.clear_chat_memory(chat_id)
         self.session_state.pop(chat_id, None)
+        info = self.user_data.get(chat_id) or {}
+        if info.get('digest'):
+            info.pop('digest', None)
+            self._save_user_data()
         await update.message.reply_text(
-            "🧹 Память разговора очищена. Книга уроков, якоря и профиль "
-            "остались. Начнём с чистого листа."
+            "🧹 Память разговора и дайджест очищены. Книга уроков, якоря и "
+            "профиль остались. Начнём с чистого листа."
         )
 
     # ---------------- Ритуалы и сессия ----------------
@@ -517,8 +572,8 @@ class SoulGuideBot:
         })
 
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-        response = await self.generate_response(chat_id, message.chat.type,
-                                                mode='morning')
+        response = await self._generate_with_alive(
+            message, chat_id, mode='morning')
         await self._process_and_reply(message, chat_id, response)
 
     async def evening_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -539,8 +594,8 @@ class SoulGuideBot:
         })
 
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-        response = await self.generate_response(chat_id, message.chat.type,
-                                                mode='evening')
+        response = await self._generate_with_alive(
+            message, chat_id, mode='evening')
         await self._process_and_reply(message, chat_id, response)
 
     async def session_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -562,8 +617,8 @@ class SoulGuideBot:
             'is_bot': False,
         })
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-        response = await self.generate_response(chat_id, message.chat.type,
-                                                mode='session')
+        response = await self._generate_with_alive(
+            message, chat_id, mode='session')
         await self._process_and_reply(message, chat_id, response)
 
     # ---------------- Сообщения ----------------
@@ -646,9 +701,9 @@ class SoulGuideBot:
             else:
                 text_for_model = text
 
-            # 6. Генерация + маркеры + ответ
-            response = await self.generate_response(
-                chat_id, chat_type, user_text=text_for_model
+            # 6. Генерация (живой индикатор + пауза) + маркеры + ответ
+            response = await self._generate_with_alive(
+                message, chat_id, mode=None, user_text=text_for_model
             )
             await self._process_and_reply(message, chat_id, response)
 
@@ -798,6 +853,36 @@ class SoulGuideBot:
 
     # ---------------- Генерация ----------------
 
+    async def _generate_with_alive(self, message, chat_id: int,
+                                   mode: Optional[str] = None,
+                                   user_text: Optional[str] = None) -> Optional[str]:
+        """Генерация + живой индикатор «печатает…» (обновление каждые 4с,
+        чтобы не гас) + мягкая пауза перед ответом: над сообщением думают."""
+        typing_task = asyncio.create_task(self._keep_typing(chat_id))
+        try:
+            response = await self.generate_response(
+                chat_id, message.chat.type, mode=mode, user_text=user_text)
+            if response:
+                # Мягкая пауза 2–3 с: ответ «прочитан и осмыслен», не вывален
+                await asyncio.sleep(random.uniform(2.0, 3.0))
+            return response
+        finally:
+            typing_task.cancel()
+
+    async def _keep_typing(self, chat_id: int) -> None:
+        """Держит статус «печатает…» живым всю генерацию."""
+        if self._app is None:
+            return
+        try:
+            while True:
+                await self._app.bot.send_chat_action(
+                    chat_id=chat_id, action="typing")
+                await asyncio.sleep(4)
+        except asyncio.CancelledError:
+            raise  # отмена задачи — штатно, пропускаем дальше
+        except Exception:
+            pass  # индикатор не должен ронять генерацию
+
     async def generate_response(self, chat_id: int, chat_type: str,
                                 mode: Optional[str] = None,
                                 user_text: Optional[str] = None) -> Optional[str]:
@@ -845,6 +930,13 @@ class SoulGuideBot:
             data.append("— РАСЧЁТ (посчитан точно, тебе считать не нужно):")
             for line in build_calc_lines(info['birth_date']):
                 data.append(f"  {line}")
+
+        # Память сессий — суть прошлых разговоров (дайджест после рестарта)
+        if info.get('digest'):
+            data.append("— ПАМЯТЬ СЕССИЙ (суть наших разговоров):")
+            for ln in info['digest'].splitlines():
+                if ln.strip():
+                    data.append(f"  {ln.strip()}")
 
         lessons = info.get('lessons') or []
         active = [l for l in lessons if l.get('status') == 'в работе'][:8]
@@ -937,9 +1029,8 @@ class SoulGuideBot:
 
     async def _process_and_reply(self, message, chat_id: int,
                                  response: Optional[str]) -> None:
-        """Маркеры → сохранение; чистый текст → пользователю → в память.
-        Флаг заботы (care) потребляется первым же ответом — кроме случая,
-        когда этим же ответом модель поставила новый [CARE]."""
+        """Маркеры → сохранение; Markdown-вычистка; текст → пользователю
+        → в память. Флаг заботы потребляется первым же ответом."""
         if not response:
             await message.reply_text(
                 "⚠️ Не получилось сформировать ответ. Попробуй ещё раз."
@@ -948,6 +1039,7 @@ class SoulGuideBot:
 
         old_care = (self.user_data.get(chat_id) or {}).get('care')
         clean, confirms = self._extract_markers(response, chat_id)
+        clean = strip_markdown(clean)
         if not clean:
             if confirms:
                 clean = "Записал."
@@ -963,6 +1055,7 @@ class SoulGuideBot:
         for i in range(0, len(out), TELEGRAM_MSG_LIMIT):
             sent = await message.reply_text(out[i:i + TELEGRAM_MSG_LIMIT])
 
+        # В память — чистый текст: ни маркеров, ни звёздочек
         self.memory.add_message(chat_id, {
             'user_id': 0,
             'username': self.bot_username or 'Проводник',
@@ -977,6 +1070,58 @@ class SoulGuideBot:
         if old_care and info.get('care') == old_care:
             info.pop('care', None)
             self._save_user_data()
+
+    # ---------------- Память сессий (дайджест) ----------------
+
+    async def _build_digest(self, chat_id: int) -> Optional[str]:
+        """Один запрос к LLM: история → компактная память сессий."""
+        history = self.memory.get_chat_messages(chat_id)
+        if len(history) < 4:
+            return None
+        try:
+            messages = [
+                {"role": "system", "content": REENTRY_PROMPT},
+                {"role": "user",
+                 "content": self._history_to_text(chat_id, limit=50)},
+            ]
+            digest = await self.ai_client.generate_response(messages)
+            if not digest:
+                return None
+            digest = strip_markdown(digest).strip()
+            digest = re.sub(r'\n{3,}', '\n\n', digest)
+            if len(digest) > 1500:
+                digest = digest[:1500]
+            return digest or None
+        except Exception as e:
+            logger.error(f"Chat {chat_id}: ошибка сборки дайджеста: {e}")
+            return None
+
+    def _history_to_text(self, chat_id: int, limit: int = 50) -> str:
+        history = self.memory.get_chat_messages(chat_id)[-limit:]
+        return "\n".join(
+            f"{'Проводник' if m['is_bot'] else m.get('username', 'Человек')}: "
+            f"{m['text']}"
+            for m in history)
+
+    async def _reentry_after_restart(self) -> None:
+        """После старта: пересобрать дайджесты по накопленной истории —
+        бот возвращается в контекст, а не начинает с нуля."""
+        chats = [cid for cid in self.user_data
+                 if len(self.memory.get_chat_messages(cid)) >= 4]
+        if not chats:
+            logger.info("Возвращение в контекст: историй нет")
+            return
+        logger.info(f"Возвращение в контекст: {len(chats)} чат(ов)")
+        for chat_id in chats:
+            try:
+                digest = await self._build_digest(chat_id)
+                if digest:
+                    self.user_data.setdefault(chat_id, {})['digest'] = digest
+                    logger.info(f"Chat {chat_id}: память сессий обновлена")
+            except Exception as e:
+                logger.error(
+                    f"Chat {chat_id}: ошибка дайджеста при старте: {e}")
+        self._save_user_data()
 
     # ---------------- Персистентность ----------------
 
@@ -1012,7 +1157,10 @@ class SoulGuideBot:
     async def post_init(self, application: Application):
         bot_info = await application.bot.get_me()
         self.bot_username = bot_info.username
+        self._app = application
         logger.info(f"Бот запущен: @{self.bot_username}")
+        # Возвращение в контекст: дайджесты по накопленной истории
+        await self._reentry_after_restart()
 
     async def post_shutdown(self, application: Application):
         await self.ai_client.close()
@@ -1038,6 +1186,7 @@ class SoulGuideBot:
         application.add_handler(CommandHandler("evening", self.evening_command))
         application.add_handler(CommandHandler("set", self.set_command))
         application.add_handler(CommandHandler("profile", self.profile_command))
+        application.add_handler(CommandHandler("digest", self.digest_command))
         application.add_handler(CommandHandler("anchors", self.anchors_command))
         application.add_handler(CommandHandler("anchor", self.anchor_command))
         application.add_handler(CommandHandler("lessons", self.lessons_command))
