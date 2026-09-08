@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Telegram Bot «Проводник Души» (DeepSeek API). Версия 6.
+Telegram Bot «Проводник Души» (DeepSeek API). Версия 8.
 
 Личные чаты — отвечает на всё; группы — на слово-триггер или ответ.
 
 ПАМЯТЬ: история (50 сообщений) — chat_memory.json; профиль, книга уроков,
-якоря, фокус, дайджест — user_data.json. При старте бот пересобирает
-дайджест (Память сессий) из истории — возвращается в контекст, а не
-начинает с нуля. /digest — пересборка вручную.
+якоря, победы, фокус, дайджест, флаг заботы, follow-up — user_data.json.
+При старте — возвращение в контекст (дайджест). /digest — вручную.
 
-ДУГА: контакт → диагностика → нарастание → кульминация → бережный
-режим → закрепление. Лимиты: 2 вопроса диагностики, 4 на тему, «что в
-теле» — только в бережном режиме. 5+ обменов — принудительная кульминация.
-База: доверие и искренность; цель — внутренняя опора.
-Формат: Markdown от модели вычищается (strip_markdown); индикатор
-«печатает…» живёт всю генерацию; мягкая пауза перед ответом.
+ДУГА: контакт → диагностика → нарастание → кульминация → проживание
+(бережный режим) → закрепление. Коммутатор состояний + STATE KIT в промте;
+анти-зацикливание в коде: счётчик вопросов (4/тема, выборы не считаются),
+сброс при смене темы, принудительная кульминация на 5+ обменах.
+СОСТОЯНИЯ В КОДЕ: триггеры бережного режима, кризис-детектор, режим
+пересборки (лимит не действует до /done), follow-up-пинги через N часов
+после [LESSON]/[CARE] — бот пишет первым.
+Формат: strip_markdown; живой индикатор печати; мягкая пауза 2–3 с.
 """
 
 import asyncio
@@ -65,11 +66,9 @@ TELEGRAM_MSG_LIMIT = 4096
 GROUP_KEYWORDS = ("проводник", "наставник", "архитектор")
 RU_WEEKDAYS = ('пн', 'вт', 'ср', 'чт', 'пт', 'сб', 'вс')
 
-# Автоперехват даты рождения: ДД.ММ.ГГГГ (разделители . - /)
 DATE_RE = re.compile(r'\b(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{4})\b')
-# Тихие маркеры: [SAVE] [LESSON] [FOCUS] [PHASE] [ANCHOR] [CARE]
 MARKER_RE = re.compile(
-    r'\[\s*(SAVE|LESSON|FOCUS|PHASE|ANCHOR|CARE)\s*:\s*([^\]]+)\]')
+    r'\[\s*(SAVE|LESSON|FOCUS|PHASE|ANCHOR|CARE|WIN)\s*:\s*([^\]]+)\]')
 
 SESSION_PHASES = ('контакт', 'диагностика', 'нарастание',
                   'кульминация', 'проживание', 'закрепление')
@@ -110,7 +109,7 @@ PROFILE_LABELS = {
 ASKABLE = ('psychotype', 'hd', 'gender', 'chronotype',
            'solar', 'red_button', 'main_request')
 
-# --- Детектор словесных ловушек: КПТ-линзы в коде, ноль токенов в промте ---
+# --- Детектор словесных ловушек ---
 COGNITIVE_PATTERNS = [
     (re.compile(r'\b(всегда|никогда|постоянно|вечно)\b', re.IGNORECASE),
      'обобщение «всегда/никогда» — спроси про исключение'),
@@ -140,10 +139,27 @@ def detect_patterns(text: str, limit: int = 2) -> List[str]:
     return found
 
 
+# --- Триггеры состояний: код надёжнее промта ---
+CARE_TRIGGERS = re.compile(
+    r'\b(плачу|плакал|плакала|рыдаю|разревелся|разревелась|слёзы|слезы|'
+    r'дрожь|трясёт|трясет|ком\s+в\s+горле|больно|невмоготу|накрывает|'
+    r'трудно\s+дышать|не\s+могу\s+дышать|паник\w*)\b',
+    re.IGNORECASE)
+
+CRISIS_TRIGGERS = re.compile(
+    r'\b(не\s+вижу\s+смысла\s+жить|не\s+хочу\s+жить|хочу\s+умереть|'
+    r'покончить|самоубий\w*|убить\s+себя|себя\s+убить|'
+    r'сделать\s+с\s+собой|резать\s+себя)\b',
+    re.IGNORECASE)
+
+TOPIC_SWITCH = re.compile(
+    r'\b(друг\w*\s+тема|друг\w*\s+вопрос|нов\w*\s+тема|нов\w*\s+вопрос|'
+    r'смен\w*\s+тему|ладно[,\s]+по\b|верн\w*\s+к\b|кстати)\b',
+    re.IGNORECASE)
+
+
 def strip_markdown(text: str) -> str:
-    """Вычищает LLM-разметку: **жирный**, *курсив*, `код`, ## заголовки,
-    --- разделители. Telegram получает чистый текст без звёздочек.
-    Одиночные _ не трогаем: они бывают в именах файлов (user_data.json)."""
+    """Вычищает LLM-разметку. Одиночные _ не трогаем (имена файлов)."""
     text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
     text = re.sub(r'__(.+?)__', r'\1', text)
     text = re.sub(r'(?<!\*)\*([^*\n]+?)\*(?!\*)', r'\1', text)
@@ -173,82 +189,63 @@ class SoulGuideBot:
         self.bot_username = None
         self.user_data = self._load_user_data()
         self.session_state: Dict[int, Dict] = {}
-        self._app = None  # ссылка на Application (для индикатора печати)
+        self._app = None
+        self._followup_task = None
 
     # ---------------- Команды ----------------
 
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "🕯 Привет! Я — Проводник Души, и я рад, что ты здесь.\n\n"
-            "Давай познакомимся правильно — без анкет, но чтобы ты понимал, "
-            "с кем имеешь дело.\n\n"
             "🧭 <b>Кто я</b>\n"
-            "Наставник, который помогает проходить уроки жизни. Не гадаю, "
-            "готовых советов не выдаю и не лечу — вместо этого задаю точные "
-            "вопросы, подсвечиваю ложные убеждения и показываю зеркала "
-            "(то, что раздражает в других — твоё отражение). Ответы уже "
-            "внутри тебя. Моя работа — короткий путь к ним.\n\n"
+            "Тёплый друг-наставник с опытом и интуицией. Честно сразу: "
+            "я не терапевт и не врач, диагнозов и готовых советов не даю. "
+            "Вместо этого: точные вопросы, зеркала (что раздражает в других — "
+            "твоё отражение), техники и малые шаги. Ответы уже внутри "
+            "тебя — я помогаю найти короткий путь к ним.\n\n"
             "🔮 <b>Что я умею</b>\n"
-            "• Сессии — от пары точных вопросов до момента истины, когда "
-            "вдруг видно самое главное\n"
+            "• Сессии — от пары точных вопросов до момента истины\n"
+            "• Быстрая смена состояния: подберу технику под твоё "
+            "состояние — тревога, застыв, злость\n"
             "• Бережно вести через вскрытую боль: техники успокоения, "
-            "якоря — короткие фразы новой силы\n"
+            "якоря — фразы новой силы\n"
             "• Помню наши разговоры — и после перезапуска возвращаюсь "
-            "в контекст, а не начинаю с нуля\n"
-            "• Твои числа — напиши дату рождения прямо в разговоре, и я "
-            "точно посчитаю психоматрицу (Сюцай), личный год и фазу "
-            "возраста — кодом, без фантазий\n"
-            "• Книга уроков — убеждения и стратегии, которые мы нашли "
-            "вместе; их можно пересобрать и закрыть\n"
-            "• Ритм дня — утром карта с темой и одним действием, вечером "
-            "три вопроса для разбора\n\n"
-            "🤝 <b>Как со мной работать</b>\n"
-            "• Просто напиши, что сейчас происходит — этого достаточно "
-            "для старта. Здесь можно как есть.\n"
-            "• Хочешь глубоко — /session и тема\n"
-            "• Хочешь ритм — /morning и /evening\n\n"
-            "💬 <b>Важно</b>\n"
-            "Я не врач и не заменяю психотерапевта. Если станет тяжело — "
-            "скажи прямо: остановимся, подышим, вернёмся позже.\n\n"
-            "А теперь — самое главное. Что происходит в твоей жизни "
-            "прямо сейчас? 🌱",
+            "в контекст\n"
+            "• Книга уроков и копилка побед — что нашли и что уже "
+            "получилось\n"
+            "• Ритм: утром карта дня, вечером разбор; сам напомню "
+            "про договорённости\n\n"
+            "🤝 <b>Как работать</b>\n"
+            "Просто напиши, что сейчас происходит — этого достаточно. "
+            "Здесь можно как есть. Хочешь глубоко — /session и тема.\n\n"
+            "💬 Если станет тяжело — скажи прямо или «стоп»: "
+            "остановимся, подышим.\n\n"
+            "Что происходит в твоей жизни прямо сейчас? 🌱",
             parse_mode="HTML"
         )
 
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         help_text = (
-            "🕯 <b>Проводник Души</b> — наставник, зеркало, ежедневный "
-            "навигатор.\n\n"
+            "🕯 <b>Проводник Души</b> — наставник, зеркало, навигатор. "
+            "Я не терапевт и не врач.\n\n"
             "<b>🎧 Сессия:</b>\n"
-            "/session тема — целая сессия: от пары точных вопросов до "
-            "момента истины\n\n"
-            "<b>⚓ Якоря:</b>\n"
-            "/anchors — твои короткие новые убеждения\n"
-            "/anchor фраза — добавить якорь вручную\n\n"
-            "<b>☀️🌙 Ритм дня:</b>\n"
-            "/morning — карта дня: тема, зеркало, одно действие\n"
-            "/evening — разбор дня: три вопроса (в вс — и фокус недели)\n\n"
+            "/session тема — целая сессия до момента истины\n\n"
+            "<b>⚓ Якоря и победы:</b>\n"
+            "/anchors — якоря-убеждения · /anchor фраза — добавить\n"
+            "Победы копятся сами (когда рассказываешь о сделанном) — "
+            "видны в /profile\n\n"
+            "<b>☀️🌙 Ритм:</b>\n"
+            "/morning — карта дня · /evening — разбор (в вс — фокус)\n\n"
             "<b>📖 Книга уроков:</b>\n"
-            "/lessons — найденные убеждения и стратегии\n"
-            "/rebuild N — пошаговая пересборка убеждения\n"
-            "/done N — пометить урок проработанным\n"
-            "/focus N или /focus тема — фокус недели\n"
-            "/lesson текст — добавить урок вручную\n\n"
+            "/lessons · /rebuild N — пересборка · /done N · "
+            "/focus N или тема · /lesson текст\n\n"
             "<b>📋 Данные и память:</b>\n"
-            "/set ключ значение — birth, пол, psychotype, hd, соляр, "
-            "хронотип, кнопка, запрос\n"
-            "/profile — всё, что я о тебе знаю\n"
-            "/digest — пересобрать память сессий (что я помню о наших "
-            "разговорах)\n"
-            "Дату рождения можно просто написать в разговоре — "
-            "подхвачу сам.\n\n"
-            "<b>🧹 Память:</b>\n"
-            f"/clear_memory — с чистого листа. Вижу {self.config.max_history_messages} "
-            "последних сообщений; история, профиль и уроки переживают "
-            "перезапуск.\n\n"
-            "В группах зови меня словом «проводник».\n\n"
-            "Я не даю советов и не ставлю диагнозов. Станет тяжело — "
-            "скажи «стоп»: остановимся и подышим."
+            "/set ключ значение · /profile · /digest — память сессий\n"
+            "Дату рождения просто напиши в разговоре — подхвачу сам.\n\n"
+            "<b>🧹 /clear_memory</b> — с чистого листа (уроки, якоря "
+            "и профиль остаются).\n\n"
+            "В группах зови словом «проводник».\n\n"
+            "Станет тяжело — «стоп»: остановимся и подышим."
         )
         await update.message.reply_text(help_text, parse_mode="HTML")
 
@@ -334,6 +331,11 @@ class SoulGuideBot:
         anchors = info.get('anchors') or []
         if anchors:
             lines.append(f"⚓ Якорей: {len(anchors)} (список: /anchors)")
+        wins = info.get('wins') or []
+        if wins:
+            lines.append(f"🏆 Побед в копилке: {len(wins)} (свежие — "
+                         "«" + "», «".join(w['text'] for w in wins[-3:])
+                         + "»)")
         focus = info.get('focus_week') or {}
         if focus.get('theme'):
             lines.append(f"🎯 Фокус недели: «{focus['theme']}»")
@@ -342,7 +344,6 @@ class SoulGuideBot:
         await update.message.reply_text("\n".join(lines))
 
     async def digest_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """🧠 /digest — пересобрать память сессий из истории чата"""
         chat_id = update.effective_chat.id
         history = self.memory.get_chat_messages(chat_id)
         if len(history) < 4:
@@ -376,8 +377,7 @@ class SoulGuideBot:
             await update.message.reply_text(
                 "⚓ Якорей пока нет.\n\n"
                 "Якорь — короткое новое убеждение, твоими словами (3–7 слов), "
-                "которое возвращает в сильное состояние: «я справляюсь», "
-                "«моя нежность — не слабость». Они рождаются в сессиях "
+                "которое возвращает в сильное состояние. Рождаются в сессиях "
                 "после освобождения от старого. Добавить вручную: "
                 "/anchor фраза"
             )
@@ -416,9 +416,8 @@ class SoulGuideBot:
             await update.message.reply_text(
                 "📖 Книга уроков пуста.\n\n"
                 "Уроки появляются, когда в разговоре вскрывается ложное "
-                "убеждение или неработающая стратегия и ты подтверждаешь: "
-                "«да, это про меня». Начни: /session или просто расскажи, "
-                "что сейчас происходит."
+                "убеждение и ты подтверждаешь: «да, это про меня». "
+                "Начни: /session или просто расскажи, что происходит."
             )
             return
 
@@ -460,6 +459,9 @@ class SoulGuideBot:
                 l['status'] = 'проработан'
                 l['done_at'] = datetime.now().strftime('%d.%m')
                 self._save_user_data()
+                st = self.session_state.get(chat_id)
+                if st:
+                    st.pop('rebuild', None)
                 await update.message.reply_text(
                     f"✅ Урок «{l['title']}» — проработан. Снимаю шляпу."
                 )
@@ -527,6 +529,10 @@ class SoulGuideBot:
         user = update.effective_user
         username = ((user.username or user.first_name or "Искатель")
                     if user else "Искатель")
+
+        st = self.session_state.setdefault(chat_id, {})
+        st['rebuild'] = True
+
         self.memory.add_message(chat_id, {
             'user_id': user.id if user else 0,
             'username': username,
@@ -548,8 +554,8 @@ class SoulGuideBot:
             info.pop('digest', None)
             self._save_user_data()
         await update.message.reply_text(
-            "🧹 Память разговора и дайджест очищены. Книга уроков, якоря и "
-            "профиль остались. Начнём с чистого листа."
+            "🧹 Память разговора и дайджест очищены. Книга уроков, якоря, "
+            "победы и профиль остались. Начнём с чистого листа."
         )
 
     # ---------------- Ритуалы и сессия ----------------
@@ -599,7 +605,6 @@ class SoulGuideBot:
         await self._process_and_reply(message, chat_id, response)
 
     async def session_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """🎧 /session [тема] — полная сессия по запросу"""
         message = update.message
         chat_id = update.effective_chat.id
         user = update.effective_user
@@ -640,14 +645,12 @@ class SoulGuideBot:
             username = user.username or user.first_name or "Искатель"
             raw_text = message.text
 
-            # 0. Имя — тихо из Telegram (только личка)
             if chat_type == 'private':
                 profile = self.user_data.setdefault(chat_id, {})
                 if user.first_name and profile.get('name') != user.first_name:
                     profile['name'] = user.first_name
                     self._save_user_data()
 
-            # 1. Отвечать ли
             should_respond = False
             if chat_type == 'private':
                 should_respond = True
@@ -665,7 +668,6 @@ class SoulGuideBot:
                 if should_respond:
                     logger.info(f"Group mention in chat {chat_id}")
 
-            # 2. Вырезаем @username бота
             text = raw_text
             if self.bot_username:
                 text = re.sub(
@@ -677,10 +679,8 @@ class SoulGuideBot:
             if not text:
                 return
 
-            # 3. Автоперехват даты рождения
             self._try_capture_birth(chat_id, text, chat_type)
 
-            # 4. Память
             self.memory.add_message(chat_id, {
                 'user_id': user.id,
                 'username': username,
@@ -694,14 +694,34 @@ class SoulGuideBot:
 
             await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
-            # 5. Детектор ловушек
+            # Детектор ловушек + триггеры состояний
+            hints = []
             pattern_hint = detect_patterns(text)
             if pattern_hint:
-                text_for_model = f"{text}\n[Паттерн: {'; '.join(pattern_hint)}]"
-            else:
-                text_for_model = text
+                hints.append(f"[Паттерн: {'; '.join(pattern_hint)}]")
 
-            # 6. Генерация (живой индикатор + пауза) + маркеры + ответ
+            if CRISIS_TRIGGERS.search(text):
+                hints.append("[КРИЗИС: признаки острого кризиса — "
+                             "отмени дугу, протокол кризиса]")
+                st = self.session_state.setdefault(chat_id, {})
+                st['crisis'] = True
+                st.pop('rebuild', None)
+            elif CARE_TRIGGERS.search(text):
+                hints.append("[БЕРЕЖНЫЙ РЕЖИМ: триггер боли — "
+                             "включи бережный режим]")
+
+            if TOPIC_SWITCH.search(text):
+                hints.append("[НОВАЯ ТЕМА: счётчики сброшены — короткий "
+                             "контракт новой темы, начни с контакта]")
+                st = self.session_state.get(chat_id)
+                if st:
+                    st['questions'] = 0
+                    st['turns'] = 0
+                    st.pop('rebuild', None)
+                    st.pop('crisis', None)
+
+            text_for_model = text if not hints else text + "\n" + "\n".join(hints)
+
             response = await self._generate_with_alive(
                 message, chat_id, mode=None, user_text=text_for_model
             )
@@ -750,8 +770,8 @@ class SoulGuideBot:
         return True
 
     def _extract_markers(self, text: str, chat_id: int) -> Tuple[str, List[str]]:
-        """Вырезает маркеры, сохраняет данные.
-        Возвращает чистый текст и строки подтверждения пользователю."""
+        """Вырезает маркеры, сохраняет данные, ставит follow-up.
+        Возвращает чистый текст и строки подтверждения."""
         confirms: List[str] = []
 
         for m in MARKER_RE.finditer(text):
@@ -774,6 +794,7 @@ class SoulGuideBot:
                 title = body.strip(' «»"\'')
                 if title:
                     self._add_lesson(chat_id, title)
+                    self._set_followup(chat_id, 'lesson', title)
                     confirms.append(f"📖 В книгу уроков: «{title}»")
 
             elif kind == 'FOCUS':
@@ -788,6 +809,12 @@ class SoulGuideBot:
                     self._add_anchor(chat_id, phrase)
                     confirms.append(f"⚓ Якорь сохранён: «{phrase}»")
 
+            elif kind == 'WIN':
+                phrase = body.strip(' «»"\'')
+                if phrase:
+                    self._add_win(chat_id, phrase)
+                    confirms.append(f"🏆 В копилку побед: «{phrase}»")
+
             elif kind == 'CARE':
                 topic = body.strip(' «»"\'')
                 if topic:
@@ -795,6 +822,7 @@ class SoulGuideBot:
                         'topic': topic,
                         'set_at': datetime.now().strftime('%d.%m %H:%M'),
                     }
+                    self._set_followup(chat_id, 'care', topic)
                     self._save_user_data()
                     confirms.append(
                         "🌱 Завтра спрошу, как ты. Обещаю.")
@@ -831,17 +859,46 @@ class SoulGuideBot:
         })
         self._save_user_data()
 
+    def _add_win(self, chat_id: int, phrase: str) -> None:
+        wins = self.user_data.setdefault(chat_id, {}).setdefault('wins', [])
+        if any(w['text'].lower() == phrase.lower() for w in wins):
+            return
+        wins.append({
+            'text': phrase,
+            'created': datetime.now().strftime('%d.%m'),
+        })
+        # Держим копилку компактной: последние 15
+        if len(wins) > 15:
+            del wins[:len(wins) - 15]
+        self._save_user_data()
+
+    def _set_followup(self, chat_id: int, ftype: str, topic: str) -> None:
+        """Follow-up-пинг: бот сам напишет через followup_hours."""
+        self.user_data.setdefault(chat_id, {})['followup'] = {
+            'type': ftype,
+            'topic': topic,
+            'due_ts': time.time() + self.config.followup_hours * 3600,
+        }
+        self._save_user_data()
+
     def _update_phase(self, chat_id: int, phase: str) -> None:
         st = self.session_state.get(chat_id) or {}
-        turns = 1 if phase == 'контакт' else st.get('turns', 0) + 1
+        new_topic = (phase == 'контакт')
+        turns = 1 if new_topic else st.get('turns', 0) + 1
         same = st.get('same', 0) + 1 if st.get('phase') == phase else 1
         force = (turns >= 5
                  and phase not in ('кульминация', 'проживание', 'закрепление'))
+        crisis = bool(st.get('crisis')) and not new_topic
+        rebuild = bool(st.get('rebuild')) and not new_topic
+        questions = 0 if new_topic else st.get('questions', 0)
         self.session_state[chat_id] = {
             'phase': phase,
             'same': same,
             'turns': turns,
             'force': force,
+            'crisis': crisis,
+            'rebuild': rebuild,
+            'questions': questions,
         }
 
     def _set_focus(self, chat_id: int, theme: str) -> None:
@@ -856,21 +913,17 @@ class SoulGuideBot:
     async def _generate_with_alive(self, message, chat_id: int,
                                    mode: Optional[str] = None,
                                    user_text: Optional[str] = None) -> Optional[str]:
-        """Генерация + живой индикатор «печатает…» (обновление каждые 4с,
-        чтобы не гас) + мягкая пауза перед ответом: над сообщением думают."""
         typing_task = asyncio.create_task(self._keep_typing(chat_id))
         try:
             response = await self.generate_response(
                 chat_id, message.chat.type, mode=mode, user_text=user_text)
             if response:
-                # Мягкая пауза 2–3 с: ответ «прочитан и осмыслен», не вывален
                 await asyncio.sleep(random.uniform(2.0, 3.0))
             return response
         finally:
             typing_task.cancel()
 
     async def _keep_typing(self, chat_id: int) -> None:
-        """Держит статус «печатает…» живым всю генерацию."""
         if self._app is None:
             return
         try:
@@ -879,9 +932,9 @@ class SoulGuideBot:
                     chat_id=chat_id, action="typing")
                 await asyncio.sleep(4)
         except asyncio.CancelledError:
-            raise  # отмена задачи — штатно, пропускаем дальше
+            raise
         except Exception:
-            pass  # индикатор не должен ронять генерацию
+            pass
 
     async def generate_response(self, chat_id: int, chat_type: str,
                                 mode: Optional[str] = None,
@@ -931,7 +984,6 @@ class SoulGuideBot:
             for line in build_calc_lines(info['birth_date']):
                 data.append(f"  {line}")
 
-        # Память сессий — суть прошлых разговоров (дайджест после рестарта)
         if info.get('digest'):
             data.append("— ПАМЯТЬ СЕССИЙ (суть наших разговоров):")
             for ln in info['digest'].splitlines():
@@ -952,10 +1004,16 @@ class SoulGuideBot:
 
         anchors = (info.get('anchors') or [])[-3:]
         if anchors:
-            data.append("— ЯКОРЯ (новые убеждения; напоминай по одному, "
-                        "в уместный момент):")
+            data.append("— ЯКОРЯ (напоминай по одному, в уместный момент):")
             for a in anchors:
                 data.append(f"  ⚓ «{a['text']}»")
+
+        wins = (info.get('wins') or [])[-3:]
+        if wins:
+            data.append("— ПОБЕДЫ (микро-победы; при залипании поднимай "
+                        "как доказательства «у тебя получается»):")
+            for w in wins:
+                data.append(f"  🏆 «{w['text']}»")
 
         focus = info.get('focus_week') or {}
         if focus.get('theme'):
@@ -971,36 +1029,58 @@ class SoulGuideBot:
                 f"— ⚠️ БЕРЕЖНЫЙ РЕЖИМ: недавно вскрыта глубокая тема "
                 f"«{care.get('topic', '')}». Начни этот ответ одной короткой "
                 "фразой заботы о самочувствии; при уместности напомни один "
-                "якорь; затем продолжай по ситуации. Если человек в порядке — "
-                "просто дальше по разговору.")
+                "якорь; затем продолжай по ситуации.")
 
-        # Фаза сессии + жёсткое анти-зацикливание
         st = self.session_state.get(chat_id)
         if st:
-            data.append(
-                f"— Фаза сессии: {st['phase']} "
-                f"(обменов в теме: {st.get('turns', 1)})")
-            if st.get('force'):
+            if st.get('crisis'):
                 data.append(
-                    "— ПРЕДОХРАНИТЕЛЬ: тема идёт 5+ обменов. Следующий "
-                    "ответ — кульминация: одна плотная формулировка «в "
-                    "точку», БЕЗ вопросов. Затем бережный режим и "
-                    "закрепление.")
-            elif st.get('same', 1) >= 2 and st['phase'] == 'контакт':
+                    "— КРИЗИСНЫЙ РЕЖИМ: дуга отменена. Протокол: 1) «я с "
+                    "тобой», дышим; 2) «ты в безопасности прямо сейчас?» "
+                    "(опасность — 112 / позвать близкого); 3) живая "
+                    "поддержка. Без анализа, короткие реплики.")
+            else:
+                q = st.get('questions', 0)
+                if st.get('rebuild'):
+                    data.append(
+                        "— РЕЖИМ ПЕРЕСБОРКИ: лимит вопросов не действует; "
+                        "один вопрос на реплику по шагам пересборки.")
                 data.append(
-                    "— ЗАВИСАНИЕ: контакт затянут. Следующий ответ — "
-                    "диагностика, без приветствий.")
-            elif st.get('same', 1) >= 2 and st['phase'] == 'диагностика':
-                data.append(
-                    "— ЛИМИТ ДИАГНОСТИКИ ИСЧЕРПАН: вопросы запрещены. "
-                    "Следующий ответ — кульминация.")
-            elif st.get('same', 1) >= 2 and st['phase'] == 'нарастание':
-                data.append(
-                    "— ЗАВИСАНИЕ: материала достаточно. Следующий ответ — "
-                    "кульминация, без вопросов.")
-            elif st.get('same', 1) >= 3 and st['phase'] == 'проживание':
-                data.append(
-                    "— Пора к закреплению: смысл, малый шаг, тёплое закрытие.")
+                    f"— Фаза сессии: {st['phase']} "
+                    f"(обменов: {st.get('turns', 1)}; "
+                    f"вопросов задано: {q}/4)")
+                if q >= 4 and st['phase'] != 'проживание':
+                    data.append(
+                        "— ЛИМИТ ВОПРОСОВ ИСЧЕРПАН (4/4): только выборы "
+                        "(нумерованные варианты без «?»), кульминация или "
+                        "закрепление.")
+                elif q == 3 and st['phase'] != 'проживание':
+                    data.append(
+                        "— Остался один вопрос до лимита; после — только "
+                        "выборы и утверждения.")
+                if st.get('force'):
+                    data.append(
+                        "— ПРЕДОХРАНИТЕЛЬ: тема идёт 5+ обменов. Следующий "
+                        "ответ — кульминация: 1–3 коротких предложения, "
+                        "БЕЗ вопросов. Затем проживание и закрепление.")
+                elif st.get('turns', 0) >= 4:
+                    data.append("— СЖАТИЕ: реплики короче, к сути.")
+                elif st.get('same', 1) >= 2 and st['phase'] == 'контакт':
+                    data.append(
+                        "— ЗАВИСАНИЕ: контакт затянут. Следующий ответ — "
+                        "диагностика, без приветствий.")
+                elif st.get('same', 1) >= 2 and st['phase'] == 'диагностика':
+                    data.append(
+                        "— ЗАВИСАНИЕ: гипотезу пора проверять кульминацией, "
+                        "без новых вопросов.")
+                elif st.get('same', 1) >= 2 and st['phase'] == 'нарастание':
+                    data.append(
+                        "— ЗАВИСАНИЕ: материала достаточно. Следующий ответ "
+                        "— кульминация, без вопросов.")
+                elif st.get('same', 1) >= 3 and st['phase'] == 'проживание':
+                    data.append(
+                        "— Пора к закреплению: смысл, малый шаг, тёплое "
+                        "закрытие.")
         else:
             data.append("— Фаза сессии: не отслежена (начни с контакта)")
 
@@ -1029,8 +1109,6 @@ class SoulGuideBot:
 
     async def _process_and_reply(self, message, chat_id: int,
                                  response: Optional[str]) -> None:
-        """Маркеры → сохранение; Markdown-вычистка; текст → пользователю
-        → в память. Флаг заботы потребляется первым же ответом."""
         if not response:
             await message.reply_text(
                 "⚠️ Не получилось сформировать ответ. Попробуй ещё раз."
@@ -1055,7 +1133,6 @@ class SoulGuideBot:
         for i in range(0, len(out), TELEGRAM_MSG_LIMIT):
             sent = await message.reply_text(out[i:i + TELEGRAM_MSG_LIMIT])
 
-        # В память — чистый текст: ни маркеров, ни звёздочек
         self.memory.add_message(chat_id, {
             'user_id': 0,
             'username': self.bot_username or 'Проводник',
@@ -1064,17 +1141,70 @@ class SoulGuideBot:
             'is_bot': True,
         })
 
-        # Эхо-забота сработала этим ответом — флаг снимаем.
-        # Если модель этим же ответом поставила НОВЫЙ [CARE] — он остаётся.
+        st = self.session_state.get(chat_id)
+        if st is not None and not st.get('rebuild'):
+            st['questions'] = st.get('questions', 0) + clean.count('?')
+
         info = self.user_data.get(chat_id) or {}
         if old_care and info.get('care') == old_care:
             info.pop('care', None)
             self._save_user_data()
 
+    # ---------------- Follow-up пинги ----------------
+
+    async def _followup_loop(self) -> None:
+        """Каждые 10 минут проверяет отложенные пинги. По наступлении
+        срока бот пишет первым: после [LESSON] — про эксперимент,
+        после [CARE] — про самочувствие."""
+        logger.info("Follow-up петля запущена (проверка каждые 10 мин)")
+        while True:
+            try:
+                await asyncio.sleep(600)
+                now_ts = time.time()
+                fired = False
+                for chat_id, info in self.user_data.items():
+                    fu = info.get('followup')
+                    if not fu or fu.get('due_ts', 0) > now_ts:
+                        continue
+                    try:
+                        if fu.get('type') == 'lesson':
+                            text = (f"👋 Вчера мы договорились: ты проведёшь "
+                                    f"эксперимент «{fu.get('topic', '')}». "
+                                    "Удалось? Как ощущения от 0 до 10?")
+                        else:
+                            text = ("👋 Вчера был глубокий процесс. "
+                                    "Как ты сегодня дышишь? "
+                                    "Что с уровнем энергии?")
+                            info['care'] = {
+                                'topic': fu.get('topic', ''),
+                                'set_at': datetime.now().strftime('%d.%m %H:%M'),
+                            }
+                        await self._app.bot.send_message(
+                            chat_id=chat_id, text=text)
+                        self.memory.add_message(chat_id, {
+                            'user_id': 0,
+                            'username': self.bot_username or 'Проводник',
+                            'text': text,
+                            'timestamp': datetime.now().isoformat(),
+                            'is_bot': True,
+                        })
+                        info.pop('followup', None)
+                        fired = True
+                        logger.info(f"Chat {chat_id}: follow-up отправлен")
+                    except Exception as e:
+                        logger.error(
+                            f"Chat {chat_id}: ошибка follow-up: {e}")
+                        info.pop('followup', None)  # не мучаем повторами
+                if fired:
+                    self._save_user_data()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"Ошибка в follow-up петле: {e}")
+
     # ---------------- Память сессий (дайджест) ----------------
 
     async def _build_digest(self, chat_id: int) -> Optional[str]:
-        """Один запрос к LLM: история → компактная память сессий."""
         history = self.memory.get_chat_messages(chat_id)
         if len(history) < 4:
             return None
@@ -1104,8 +1234,6 @@ class SoulGuideBot:
             for m in history)
 
     async def _reentry_after_restart(self) -> None:
-        """После старта: пересобрать дайджесты по накопленной истории —
-        бот возвращается в контекст, а не начинает с нуля."""
         chats = [cid for cid in self.user_data
                  if len(self.memory.get_chat_messages(cid)) >= 4]
         if not chats:
@@ -1159,10 +1287,12 @@ class SoulGuideBot:
         self.bot_username = bot_info.username
         self._app = application
         logger.info(f"Бот запущен: @{self.bot_username}")
-        # Возвращение в контекст: дайджесты по накопленной истории
         await self._reentry_after_restart()
+        self._followup_task = asyncio.create_task(self._followup_loop())
 
     async def post_shutdown(self, application: Application):
+        if self._followup_task:
+            self._followup_task.cancel()
         await self.ai_client.close()
         logger.info("AI-клиент закрыт")
 
